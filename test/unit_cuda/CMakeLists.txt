@@ -14,6 +14,7 @@ set(UNIT_TEST_SOURCES_GPU
         sfc/common.cu
         traversal/groups.cu
         traversal/macs.cu
+	traversal/traversal.cu
         tree/btree.cu
         tree/csarray.cu
         tree/octree.cu
