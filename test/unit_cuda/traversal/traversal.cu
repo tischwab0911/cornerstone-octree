@@ -31,6 +31,7 @@
 namespace cstone
 {
 
+template<int consumerMultiple>
 __global__ void dualTraversalGrid(const TreeNodeIndex* __restrict__ childOffsets,
                                         TreeNodeIndex rootA,
                                         TreeNodeIndex rootB,
@@ -54,13 +55,15 @@ __global__ void dualTraversalGrid(const TreeNodeIndex* __restrict__ childOffsets
     };
     // Perform the dual traversal starting from the roots.  The pointer
     // childOffsets refers to the GPU octree’s child pointer array.
-    dualTraversalCluster(childOffsets, rootA, rootB,
+    dualTraversalCluster<consumerMultiple>(childOffsets, rootA, rootB,
                          allPairs, m2l, p2p);
 }
 
 template <class KeyType>
 void dualTraversalAllPairsGpu()
 {
+    constexpr int numThreadsPerBlock = 9*32;
+    constexpr int consumerMultiple = (numThreadsPerBlock - GpuConfig::warpSize) / GpuConfig::warpSize;
     // Build a simple tree on the CPU with 22 leaves.  The tree
     // structure follows the same construction as in the CPU test:
     // start with one node, split once, then split child 0 three more
@@ -94,10 +97,9 @@ void dualTraversalAllPairsGpu()
     cudaMalloc(&d_count, sizeof(unsigned));
     cudaMemset(d_count, 0, sizeof(unsigned));
 
-    dim3 block(64,1,1);
+    dim3 block(numThreadsPerBlock,1,1);
     dim3 grid(8,1,1);
-    
-    dualTraversalGrid<<<grid, block>>>(
+    dualTraversalGrid<consumerMultiple><<<grid, block>>>(
         rawPtr(gpuTree.childOffsets), 0, 0, rawPtr(d_pairs), d_count);
 
     cudaDeviceSynchronize();
