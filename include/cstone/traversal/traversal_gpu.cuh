@@ -169,7 +169,6 @@ __device__ void dualTraversalBlock( const TreeNodeIndex* __restrict__ childOffse
                         cuda::memcpy_async(&bufferm2l[prodStageIdx][consumer * GpuConfig::warpSize + blockThreadIdx], &m2lItemBuffer[consumer],
                                             sizeof(WorkItem), m2lPipeline);
                     }
-            
                     m2lPipeline.producer_commit();
 
                     // put p2p items into the pipeline
@@ -278,13 +277,16 @@ __device__ void dualTraversalBlock( const TreeNodeIndex* __restrict__ childOffse
 }
 
 template <int consumerMultiple, class MAC, class M2L, class P2P>
-__device__ void dualTraversalCluster( const TreeNodeIndex* __restrict__ childOffsets,
+__device__ void dualTraversalTBC( const TreeNodeIndex* __restrict__ childOffsets,
                                         TreeNodeIndex a, TreeNodeIndex b,
                                         MAC&& continuation, M2L&& m2l, P2P&& p2p) {
 
     // __shared__ TreeNodeIndex nodeAClusterStack[128];
     // __shared__ TreeNodeIndex nodeBClusterStack[128];
     // __shared__ int nextFreePos;
+
+    /* TODO: Distribute Work to blocks and set up TBC stack*/
+
 
     assert(blockDim.x%GpuConfig::warpSize == 0 && "blockDim must be multiple of GPU warpSize");
 
@@ -293,6 +295,24 @@ __device__ void dualTraversalCluster( const TreeNodeIndex* __restrict__ childOff
                             std::forward<M2L>(m2l),
                             std::forward<P2P>(p2p));
     
+}
+
+template<int consumerMultiple, class MAC, class M2L, class P2P>
+__device__ void dualTraversalGPU(const TreeNodeIndex* __restrict__ childOffsets,
+                                  TreeNodeIndex rootA, TreeNodeIndex rootB,
+                                  MAC&& continuation, M2L&& m2l, P2P&& p2p) {
+
+    const unsigned workIdx = blockIdx.x;
+    const unsigned numClusters = gridDim.x;
+    assert(numClusters == 8);
+    TreeNodeIndex a = childOffsets[rootA] + workIdx;
+    TreeNodeIndex b = rootB;
+
+    /* TODO: Distribute work to TBCs*/
+    /* TODO (long-term): investigate load balancing strategies (potentially introduce global stack)*/
+
+    dualTraversalTBC<consumerMultiple>(childOffsets, a, b, std::forward<MAC>(continuation), 
+                                           std::forward<M2L>(m2l), std::forward<P2P>(p2p));
 }
 
 } // namespace cstone

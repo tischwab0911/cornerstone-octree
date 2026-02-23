@@ -32,30 +32,31 @@ namespace cstone
 {
 
 template<int consumerMultiple>
-__global__ void dualTraversalGrid(const TreeNodeIndex* __restrict__ childOffsets,
+__global__ void dualTraversalCount(const TreeNodeIndex* __restrict__ childOffsets,
                                         TreeNodeIndex rootA,
                                         TreeNodeIndex rootB,
-                                        util::array<TreeNodeIndex, 2>* pairs,
-                                        unsigned* pairCount)
+                                        util::array<TreeNodeIndex, 2>* p2pPairs,
+                                        util::array<TreeNodeIndex, 2>* m2lPairs,
+                                        unsigned* p2pPairCount,
+                                        unsigned* m2lPairCount)
 {
-    const unsigned workIdx = blockIdx.x;
-    const unsigned numClusters = gridDim.x;
-    assert(numClusters == 8);
-    rootA = childOffsets[rootA] + workIdx;
-
     // admissibility criterion: accept all internal node pairs
     auto allPairs = [] __device__(TreeNodeIndex, TreeNodeIndex) { return true; };
     // multipole‑to‑local interaction (unused here)
-    auto m2l = [] __device__(TreeNodeIndex, TreeNodeIndex) {};
+    auto m2l = [m2lPairs, m2lPairCount] __device__(TreeNodeIndex a, TreeNodeIndex b) {
+        unsigned idx = atomicAdd(m2lPairCount, 1u);
+        m2lPairs[idx][0] = a;
+        m2lPairs[idx][1] = b;
+    };
     // particle‑to‑particle interaction: record each leaf pair atomically
-    auto p2p = [pairs, pairCount] __device__(TreeNodeIndex a, TreeNodeIndex b) {
-        unsigned idx = atomicAdd(pairCount, 1u);
-        pairs[idx][0] = a;
-        pairs[idx][1] = b;
+    auto p2p = [p2pPairs, p2pPairCount] __device__(TreeNodeIndex a, TreeNodeIndex b) {
+        unsigned idx = atomicAdd(p2pPairCount, 1u);
+        p2pPairs[idx][0] = a;
+        p2pPairs[idx][1] = b;
     };
     // Perform the dual traversal starting from the roots.  The pointer
     // childOffsets refers to the GPU octree’s child pointer array.
-    dualTraversalCluster<consumerMultiple>(childOffsets, rootA, rootB,
+    dualTraversalGPU<consumerMultiple>(childOffsets, rootA, rootB,
                          allPairs, m2l, p2p);
 }
 
@@ -74,15 +75,21 @@ void dualTraversalAllPairsGpu()
 
     // Compute the reference set of leaf‑pairs on the CPU using the
     // existing dualTraversal implementation.
-    std::vector<util::array<TreeNodeIndex, 2>> cpuPairs;
+    std::vector<util::array<TreeNodeIndex, 2>> cpum2lPairs;
+    std::vector<util::array<TreeNodeIndex, 2>> cpup2pPairs;
     auto allPairsCpu = [](TreeNodeIndex, TreeNodeIndex) { return true; };
-    auto m2lCpu = [](TreeNodeIndex, TreeNodeIndex) {};
-    auto p2pCpu = [&cpuPairs](TreeNodeIndex a, TreeNodeIndex b) {
-        cpuPairs.push_back({a, b});
+    auto m2lCpu = [&cpum2lPairs](TreeNodeIndex a, TreeNodeIndex b) {
+        cpum2lPairs.push_back({a, b});
+    };
+    auto p2pCpu = [&cpup2pPairs](TreeNodeIndex a, TreeNodeIndex b) {
+        cpup2pPairs.push_back({a, b});
     };
     dualTraversal(cpuTree.childOffsets().data(), 0, 0, allPairsCpu, m2lCpu, p2pCpu);
-    std::sort(cpuPairs.begin(), cpuPairs.end());
-    cpuPairs.erase(std::unique(cpuPairs.begin(), cpuPairs.end()), cpuPairs.end());
+    std::sort(cpup2pPairs.begin(), cpup2pPairs.end());
+    std::sort(cpum2lPairs.begin(), cpum2lPairs.end());
+    
+    cpup2pPairs.erase(std::unique(cpup2pPairs.begin(), cpup2pPairs.end()), cpup2pPairs.end());
+    cpum2lPairs.erase(std::unique(cpum2lPairs.begin(), cpum2lPairs.end()), cpum2lPairs.end());
 
     // Build the GPU representation of the same tree.
     DeviceVector<KeyType> d_leaves = leaves;
@@ -91,37 +98,63 @@ void dualTraversalAllPairsGpu()
     buildOctreeGpu(rawPtr(d_leaves), gpuTree.data());
 
     // Allocate a device buffer large enough to hold all possible pairs.
-    const unsigned maxPairs = static_cast<unsigned>(cpuPairs.size());
-    DeviceVector<util::array<TreeNodeIndex, 2>> d_pairs(maxPairs);
-    unsigned* d_count;
-    cudaMalloc(&d_count, sizeof(unsigned));
-    cudaMemset(d_count, 0, sizeof(unsigned));
+    const unsigned numP2PPairs = static_cast<unsigned>(cpup2pPairs.size());
+    const unsigned numM2LPairs = static_cast<unsigned>(cpum2lPairs.size());
+
+    DeviceVector<util::array<TreeNodeIndex, 2>> d_p2pPairs(numP2PPairs);
+    DeviceVector<util::array<TreeNodeIndex, 2>> d_m2lPairs(numM2LPairs);
+
+    unsigned* d_p2pCount;
+    unsigned* d_m2lCount;
+    cudaMalloc(&d_p2pCount, sizeof(unsigned));
+    cudaMalloc(&d_m2lCount, sizeof(unsigned));
+    cudaMemset(d_p2pCount, 0, sizeof(unsigned));
+    cudaMemset(d_m2lCount, 0, sizeof(unsigned));
 
     dim3 block(numThreadsPerBlock,1,1);
     dim3 grid(8,1,1);
-    dualTraversalGrid<consumerMultiple><<<grid, block>>>(
-        rawPtr(gpuTree.childOffsets), 0, 0, rawPtr(d_pairs), d_count);
+    dualTraversalCount<consumerMultiple><<<grid, block>>>(
+        rawPtr(gpuTree.childOffsets), 0, 0, rawPtr(d_p2pPairs), rawPtr(d_m2lPairs), d_p2pCount, d_m2lCount);
 
     cudaDeviceSynchronize();
 
     // Copy the count and pairs back to the host.
-    unsigned h_count = 0;
-    cudaMemcpy(&h_count, d_count, sizeof(unsigned), cudaMemcpyDeviceToHost);
-    std::vector<util::array<TreeNodeIndex, 2>> h_pairs;
-    h_pairs.resize(h_count);
-    cudaMemcpy(h_pairs.data(), rawPtr(d_pairs), h_count * sizeof(util::array<TreeNodeIndex, 2>),
+    unsigned h_p2pCount = 0;
+    unsigned h_m2lCount = 0;
+
+    cudaMemcpy(&h_p2pCount, d_p2pCount, sizeof(unsigned), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_m2lCount, d_m2lCount, sizeof(unsigned), cudaMemcpyDeviceToHost);
+
+    std::vector<util::array<TreeNodeIndex, 2>> h_p2pPairs;
+    h_p2pPairs.resize(h_p2pCount);
+    cudaMemcpy(h_p2pPairs.data(), rawPtr(d_p2pPairs), h_p2pCount * sizeof(util::array<TreeNodeIndex, 2>),
                cudaMemcpyDeviceToHost);
-    std::sort(h_pairs.begin(), h_pairs.end());
-    h_pairs.erase(std::unique(h_pairs.begin(), h_pairs.end()), h_pairs.end());
+    std::sort(h_p2pPairs.begin(), h_p2pPairs.end());
+    h_p2pPairs.erase(std::unique(h_p2pPairs.begin(), h_p2pPairs.end()), h_p2pPairs.end());
+
+    std::vector<util::array<TreeNodeIndex, 2>> h_m2lPairs;
+    h_m2lPairs.resize(h_m2lCount);
+    cudaMemcpy(h_m2lPairs.data(), rawPtr(d_m2lPairs), h_m2lCount * sizeof(util::array<TreeNodeIndex, 2>),
+               cudaMemcpyDeviceToHost);
+    std::sort(h_m2lPairs.begin(), h_m2lPairs.end());
+    h_m2lPairs.erase(std::unique(h_m2lPairs.begin(), h_m2lPairs.end()), h_m2lPairs.end());
 
     // Compare GPU results against CPU reference.
-    EXPECT_EQ(h_pairs.size(), cpuPairs.size());
-    for (size_t i = 0; i < cpuPairs.size(); ++i)
+    EXPECT_EQ(h_p2pPairs.size(), cpup2pPairs.size());
+    for (size_t i = 0; i < cpup2pPairs.size(); ++i)
     {
-        EXPECT_EQ(h_pairs[i], cpuPairs[i]);
+        EXPECT_EQ(h_p2pPairs[i], cpup2pPairs[i]);
     }
 
-    cudaFree(d_count);
+    EXPECT_EQ(h_m2lPairs.size(), cpum2lPairs.size());
+    for (size_t i = 0; i < cpum2lPairs.size(); ++i)
+    {
+        EXPECT_EQ(h_m2lPairs[i], cpum2lPairs[i]);
+    }
+
+
+    cudaFree(d_p2pCount);
+    cudaFree(d_m2lCount);
 }
 
 TEST(Traversal, dualTraversalAllPairsGpu)
