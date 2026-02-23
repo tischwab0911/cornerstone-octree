@@ -31,7 +31,7 @@
 namespace cstone
 {
 
-template<int consumerMultiple>
+template<int numConsumersPerBlock>
 __global__ void dualTraversalCount(const TreeNodeIndex* __restrict__ childOffsets,
                                         TreeNodeIndex rootA,
                                         TreeNodeIndex rootB,
@@ -42,29 +42,55 @@ __global__ void dualTraversalCount(const TreeNodeIndex* __restrict__ childOffset
 {
     // admissibility criterion: accept all internal node pairs
     auto allPairs = [] __device__(TreeNodeIndex, TreeNodeIndex) { return true; };
-    // multipole‑to‑local interaction (unused here)
+
+    // multipole‑to‑local interaction
     auto m2l = [m2lPairs, m2lPairCount] __device__(TreeNodeIndex a, TreeNodeIndex b) {
         unsigned idx = atomicAdd(m2lPairCount, 1u);
         m2lPairs[idx][0] = a;
         m2lPairs[idx][1] = b;
     };
+
     // particle‑to‑particle interaction: record each leaf pair atomically
     auto p2p = [p2pPairs, p2pPairCount] __device__(TreeNodeIndex a, TreeNodeIndex b) {
         unsigned idx = atomicAdd(p2pPairCount, 1u);
         p2pPairs[idx][0] = a;
         p2pPairs[idx][1] = b;
     };
-    // Perform the dual traversal starting from the roots.  The pointer
-    // childOffsets refers to the GPU octree’s child pointer array.
-    dualTraversalGPU<consumerMultiple>(childOffsets, rootA, rootB,
+    
+    
+    dualTraversalGPU<numConsumersPerBlock>(childOffsets, rootA, rootB,
                          allPairs, m2l, p2p);
 }
+
+struct TravConfig {
+
+    /*! @brief number of threads per block for the traversal kernel
+     * number of threads per block for the dual traversal kernel
+     * must be at least 64 and at most 512
+     * must be a multiple of GPU warp size
+     */
+    static constexpr unsigned numThreadsPerBlock = 4 * GpuConfig::warpSize;
+    static_assert((numThreadsPerBlock & (GpuConfig::warpSize-1)) == 0);
+    static_assert(numThreadsPerBlock >= 64 && numThreadsPerBlock <= 512);
+
+    //! @brief number of consumer warps ber block, all warps except warp 0 are consumers
+    static constexpr unsigned numConsumersPerBlock = (numThreadsPerBlock - GpuConfig::warpSize) / GpuConfig::warpSize;
+
+    //! @brief number of blocks per thread block cluster, should be a power of 8: (1, 8, 64, ...)
+    static constexpr unsigned kBlocksPerCluster = 8;
+
+    //! @brief number of TBS in grid, should be a power of 8: (1, 8, 64, ...)
+    static constexpr unsigned kNumClusters      = 8;
+
+    //! @brief total number of blocks launched in the grid
+    static constexpr unsigned kTotalBlocks      = kBlocksPerCluster * kNumClusters;
+    static_assert(kBlocksPerCluster > 0 && kNumClusters > 0);
+
+};
 
 template <class KeyType>
 void dualTraversalAllPairsGpu()
 {
-    constexpr int numThreadsPerBlock = 9*32;
-    constexpr int consumerMultiple = (numThreadsPerBlock - GpuConfig::warpSize) / GpuConfig::warpSize;
     // Build a simple tree on the CPU with 22 leaves.  The tree
     // structure follows the same construction as in the CPU test:
     // start with one node, split once, then split child 0 three more
@@ -111,10 +137,26 @@ void dualTraversalAllPairsGpu()
     cudaMemset(d_p2pCount, 0, sizeof(unsigned));
     cudaMemset(d_m2lCount, 0, sizeof(unsigned));
 
-    dim3 block(numThreadsPerBlock,1,1);
-    dim3 grid(8,1,1);
-    dualTraversalCount<consumerMultiple><<<grid, block>>>(
-        rawPtr(gpuTree.childOffsets), 0, 0, rawPtr(d_p2pPairs), rawPtr(d_m2lPairs), d_p2pCount, d_m2lCount);
+
+    // cuda launch configuration
+    dim3 block(TravConfig::numThreadsPerBlock, 1, 1);
+    dim3 grid(TravConfig::kTotalBlocks, 1, 1);
+
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim   = grid;
+    cfg.blockDim  = block;
+
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim.x = TravConfig::kBlocksPerCluster;
+    attr.val.clusterDim.y = 1;
+    attr.val.clusterDim.z = 1;
+
+    cfg.attrs    = &attr;
+    cfg.numAttrs = 1;
+
+    cudaLaunchKernelEx(&cfg, dualTraversalCount<TravConfig::numConsumersPerBlock>,
+                       rawPtr(gpuTree.childOffsets), 0, 0, rawPtr(d_p2pPairs), rawPtr(d_m2lPairs), d_p2pCount, d_m2lCount);
 
     cudaDeviceSynchronize();
 
