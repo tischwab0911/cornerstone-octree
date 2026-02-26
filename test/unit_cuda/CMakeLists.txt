@@ -15,6 +15,9 @@ set(UNIT_TEST_SOURCES_GPU
         traversal/groups.cu
         traversal/macs.cu
 	traversal/traversal.cu
+	traversal/surface_detection.cu
+	traversal/large_surface_detection.cu
+	traversal/collision.cu
         tree/btree.cu
         tree/csarray.cu
         tree/octree.cu
