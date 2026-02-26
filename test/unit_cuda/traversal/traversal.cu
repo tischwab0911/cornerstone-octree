@@ -64,17 +64,16 @@ __global__ void dualTraversalCount(const TreeNodeIndex* __restrict__ childOffset
 
 struct TravConfig {
 
+    //! @brief number of consumer warps ber block, all warps except warp 0 are consumers
+    static constexpr unsigned numConsumersPerBlock = 3;
+
     /*! @brief number of threads per block for the traversal kernel
      * number of threads per block for the dual traversal kernel
      * must be at least 64 and at most 512
      * must be a multiple of GPU warp size
      */
-    static constexpr unsigned numThreadsPerBlock = 4 * GpuConfig::warpSize;
-    static_assert((numThreadsPerBlock & (GpuConfig::warpSize-1)) == 0);
+    static constexpr unsigned numThreadsPerBlock = (numConsumersPerBlock + 1) * GpuConfig::warpSize;
     static_assert(numThreadsPerBlock >= 64 && numThreadsPerBlock <= 512);
-
-    //! @brief number of consumer warps ber block, all warps except warp 0 are consumers
-    static constexpr unsigned numConsumersPerBlock = (numThreadsPerBlock - GpuConfig::warpSize) / GpuConfig::warpSize;
 
     //! @brief number of blocks per thread block cluster, should be a power of 8: (1, 8, 64, ...)
     static constexpr unsigned kBlocksPerCluster = 8;
@@ -85,6 +84,9 @@ struct TravConfig {
     //! @brief total number of blocks launched in the grid
     static constexpr unsigned kTotalBlocks      = kBlocksPerCluster * kNumClusters;
     static_assert(kBlocksPerCluster > 0 && kNumClusters > 0);
+
+    static constexpr unsigned ClusterStackSize = GpuConfig::warpSize * kBlocksPerCluster;
+    static constexpr unsigned OverflowLevel = GpuConfig::warpSize;
 
 };
 
@@ -180,6 +182,9 @@ void dualTraversalAllPairsGpu()
                cudaMemcpyDeviceToHost);
     std::sort(h_m2lPairs.begin(), h_m2lPairs.end());
     h_m2lPairs.erase(std::unique(h_m2lPairs.begin(), h_m2lPairs.end()), h_m2lPairs.end());
+
+    printf("Expected P2P Pairs: %d, GPU Computed P2P Pairs: %d \n", cpup2pPairs.size(), h_p2pPairs.size());
+    printf("Expected M2L Pairs: %d, GPU Computed M2L Pairs: %d \n", cpum2lPairs.size(), h_m2lPairs.size());
 
     // Compare GPU results against CPU reference.
     EXPECT_EQ(h_p2pPairs.size(), cpup2pPairs.size());
