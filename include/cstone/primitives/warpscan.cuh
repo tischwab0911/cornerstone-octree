@@ -329,6 +329,13 @@ __device__ __forceinline__ int inclusiveSegscanInt(const int packedValue, const 
     return scannedValue + (carryValue & addCarry);
 }
 
+__device__ __forceinline__ int inclusiveScanBool(const bool p)
+{
+    using SignedMask        = std::make_signed_t<GpuConfig::ThreadMask>;
+    GpuConfig::ThreadMask b = ballotSync(p);
+    return popCount(SignedMask(b & lanemask_le()));
+}
+
 /*! @brief warp-level stream compaction
  *
  * @tparam       T            an elementary type
