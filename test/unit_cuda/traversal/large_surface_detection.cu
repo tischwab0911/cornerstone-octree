@@ -128,7 +128,7 @@ struct SingleTravConfig {
 struct DualTravConfig {
 
     //! @brief number of consumer warps ber block, all warps except warp 0 are consumers
-    static constexpr unsigned numConsumersPerBlock = 3;
+    static constexpr unsigned numConsumersPerBlock = 8;
 
     /*! @brief number of threads per block for the traversal kernel
      * number of threads per block for the dual traversal kernel

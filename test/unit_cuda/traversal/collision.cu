@@ -91,7 +91,7 @@ __global__ void dualTraversalHalosKernel(
 struct DualHaloConfig
 {
     //! @brief number of consumer warps per block (all warps except warp 0 are consumers)
-    static constexpr unsigned numConsumersPerBlock = 3;
+    static constexpr unsigned numConsumersPerBlock = 8;
 
     /*! @brief number of threads per block
      *  must be at least 64 and at most 512, and a multiple of warpSize
