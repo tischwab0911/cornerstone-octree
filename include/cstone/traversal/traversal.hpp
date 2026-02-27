@@ -23,6 +23,8 @@
 namespace cstone
 {
 
+    using NodePair = util::array<TreeNodeIndex, 2>;
+
 template<class C, class A>
 HOST_DEVICE_FUN void singleTraversal(const TreeNodeIndex* childOffsets,
                                      const TreeNodeIndex* parents,
@@ -148,5 +150,70 @@ void dualTraversal(
         }
     }
 }
+
+// void dualTraversal(
+//     const TreeNodeIndex* childOffsets, TreeNodeIndex a, TreeNodeIndex b, MAC&& continuation, M2L&& m2l, P2P&& p2p)
+// {
+
+//     const int maxNewChildren = 8;
+//     const int stackSize = 128;
+
+//     TreeNodeIndex stackTargets[128];
+//     TreeNodeIndex stackSources[128];
+//     stackTargets[0] = a;
+//     stackSources[0] = b;
+//     int nextFreePos = 1;
+
+//     bool stackContainsValues = true;
+
+//     TreeNodeIndex bufferTargets[8];
+//     TreeNodeIndex bufferSources[8];
+
+//     while (stackContainsValues)
+//     {
+//         int stackPos = nextFreePos-1;
+//         bool validPos = (stackPos >= 0 && stackPos < stackSize) ? 1 : 0;
+
+//         TreeNodeIndex target = validPos ? stackTargets[stackPos] : 0;
+//         TreeNodeIndex source = validPos ? stackSources[stackPos] : 0;
+
+//         TreeNodeIndex childOffsetTarget = validPos ? childOffsets[target] : 0;
+//         TreeNodeIndex childOffsetSource = validPos ? childOffsets[source] : 0;
+//         bool targetIsLeaf = childOffsetTarget == 0;
+//         bool sourceIsLeaf = childOffsetSource == 0;
+//         bool mask = ((target < source && !targetIsLeaf) || sourceIsLeaf);
+
+//         int producedPairs = 0;
+
+//         for (int octant = 0; octant < maxNewChildren; ++octant) {
+//             TreeNodeIndex targetNodeIdx = (1 - mask) * target + (childOffsetTarget + octant) * mask;
+//             TreeNodeIndex sourceNodeIdx = mask * source       + (childOffsetSource + octant) * (1 - mask);
+//             bool continueTraversal = continuation(targetNodeIdx,sourceNodeIdx);
+//             targetIsLeaf = childOffsets[targetNodeIdx] == 0;
+//             sourceIsLeaf = childOffsets[sourceNodeIdx] == 0;
+
+//             bool addPairToLocalStack = continueTraversal && !(targetIsLeaf && sourceIsLeaf);
+//             bufferTargets[producedPairs] = addPairToLocalStack ? targetNodeIdx : bufferTargets[producedPairs];
+//             bufferSources[producedPairs] = addPairToLocalStack ? sourceNodeIdx : bufferSources[producedPairs];
+//             producedPairs += addPairToLocalStack;
+
+//             if (!addPairToLocalStack && !continueTraversal) m2l(targetNodeIdx, sourceNodeIdx);
+//             else if (!addPairToLocalStack && continueTraversal && validPos) p2p(targetNodeIdx, sourceNodeIdx);
+//         }
+
+//         --nextFreePos;
+//         int writeNewPos = nextFreePos;
+//         nextFreePos += producedPairs;
+
+//         if (nextFreePos == 0) stackContainsValues = false;
+
+//         for (int i = 0; i < 8; ++i) {
+//             if (i < producedPairs) {
+//                 stackTargets[writeNewPos + i] = bufferTargets[i];
+//                 stackSources[writeNewPos + i] = bufferSources[i];
+//             }
+//         }
+//     }
+// }
 
 } // namespace cstone
