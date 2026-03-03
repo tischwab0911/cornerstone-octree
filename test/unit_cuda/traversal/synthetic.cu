@@ -264,12 +264,12 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
     };
 
     // ── Dual traversal lambda ────────────────────────────────────────────────
-    unsigned smemBytes = dualTraversalSmemBytes(DualConfig::queueCap, DualConfig::numWarps);
+    // unsigned smemBytes = dualTraversalSmemBytes(DualConfig::queueCap, DualConfig::numWarps);
 
     cudaLaunchConfig_t dualCfg{};
     dualCfg.gridDim  = {DualConfig::kTotalBlocks, 1, 1};
     dualCfg.blockDim = {DualConfig::numThreadsPerBlock, 1, 1};
-    dualCfg.dynamicSmemBytes = smemBytes;
+    // dualCfg.dynamicSmemBytes = smemBytes;
 
     cudaLaunchAttribute dualAttr{};
     dualAttr.id               = cudaLaunchAttributeClusterDimension;

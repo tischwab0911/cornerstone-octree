@@ -235,12 +235,12 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
     cudaMalloc(&d_dualM2LCount,   sizeof(unsigned));
 
     // ── Dual traversal launch configuration (cluster-based) ──────
-    unsigned smemBytes = dualTraversalSmemBytes(DualTravConfig::queueCap, DualTravConfig::numWarps);
+    // unsigned smemBytes = dualTraversalSmemBytes(DualTravConfig::queueCap, DualTravConfig::numWarps);
 
     cudaLaunchConfig_t dualCfg{};
     dualCfg.gridDim  = {DualTravConfig::kTotalBlocks, 1, 1};
     dualCfg.blockDim = {DualTravConfig::numThreadsPerBlock, 1, 1};
-    dualCfg.dynamicSmemBytes = smemBytes;
+    // dualCfg.dynamicSmemBytes = smemBytes;
 
     cudaLaunchAttribute dualAttr{};
     dualAttr.id               = cudaLaunchAttributeClusterDimension;

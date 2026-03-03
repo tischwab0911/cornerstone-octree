@@ -221,12 +221,12 @@ void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize =
     uint8_t* d_dualFlags = nullptr;
     cudaMalloc(&d_dualFlags, numTreeNodes * sizeof(uint8_t));
 
-    unsigned smemBytes = dualTraversalSmemBytes(DualHaloConfig::queueCap, DualHaloConfig::numWarps);
+    // unsigned smemBytes = dualTraversalSmemBytes(DualHaloConfig::queueCap, DualHaloConfig::numWarps);
 
     cudaLaunchConfig_t dualCfg{};
     dualCfg.gridDim  = {DualHaloConfig::kTotalBlocks, 1, 1};
     dualCfg.blockDim = {DualHaloConfig::numThreadsPerBlock, 1, 1};
-    dualCfg.dynamicSmemBytes = smemBytes;
+    // dualCfg.dynamicSmemBytes = smemBytes;
 
     cudaLaunchAttribute dualAttr{};
     dualAttr.id               = cudaLaunchAttributeClusterDimension;

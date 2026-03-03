@@ -128,13 +128,13 @@ void dualTraversalAllPairsGpu()
     cudaMemset(d_m2lCount, 0, sizeof(unsigned));
 
     // Compute dynamic shared memory size
-    unsigned smemBytes = dualTraversalSmemBytes(TravConfig::queueCap, TravConfig::numWarps);
+    // unsigned smemBytes = dualTraversalSmemBytes(TravConfig::queueCap, TravConfig::numWarps);
 
     // Cluster launch configuration
     cudaLaunchConfig_t cfg{};
     cfg.gridDim   = {TravConfig::kTotalBlocks, 1, 1};
     cfg.blockDim  = {TravConfig::numThreadsPerBlock, 1, 1};
-    cfg.dynamicSmemBytes = smemBytes;
+    // cfg.dynamicSmemBytes = smemBytes;
 
     cudaLaunchAttribute attr{};
     attr.id = cudaLaunchAttributeClusterDimension;
