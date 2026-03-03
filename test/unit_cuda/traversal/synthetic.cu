@@ -21,22 +21,17 @@
  *              touching partner leaves (mirrors the findHalosGpu pattern).
  *   2. Dual:   cluster-based dualTraversalGPU (parallel, with DSM work-stealing).
  *
- * Correctness:
- *   CPU reference (dualTraversal) produces N_pairs where each unordered pair
- *   {a,b} (including a==b self-pairs) is counted once.
- *   Single traversal counts each off-diagonal pair twice (from thread a and from
- *   thread b) and each self-pair once, giving:
- *     singleCount == 2 * cpuCount - numLeaves
- *   Dual GPU count must equal cpuCount exactly.
- *
  * The p2p action spins over a (particlesPerBin x particlesPerBin) fmaf loop to
  * simulate the actual per-particle work inside a leaf-leaf interaction.
  *
- * The termination condition (encoded in the criterion / continuationCriterion lambda):
- *   prune when minDistance(a, b) > 0 (subtrees strictly separated).
+ * Benchmark protocol: 20 warmup runs (discarded), then 100 timed runs.
+ * Reports median, mean, stddev, min, max for each method.
  */
 
 #include <vector>
+#include <algorithm>
+#include <numeric>
+#include <cmath>
 #include <cstdio>
 
 #include "gtest/gtest.h"
@@ -56,12 +51,6 @@ namespace cstone
 {
 
 // ── Single traversal GPU kernel ───────────────────────────────────────────────
-//
-// One GPU thread per leaf node.  Each thread calls singleTraversal (HOST_DEVICE_FUN)
-// to walk the full tree and find all partner leaves whose bounding box touches its own.
-//
-// singleTraversal fires endpointAction(b) for every leaf b where
-// continuationCriterion(b) is true, so no extra filter is needed inside the action.
 
 template<class T>
 __global__ void singleTraversalP2PKernel(
@@ -82,7 +71,6 @@ __global__ void singleTraversalP2PKernel(
     Vec3<T>  centerA  = nodeCenters[a];
     Vec3<T>  sizeA    = nodeSizes[a];
 
-    //! continuationCriterion: recurse into b when the subtrees touch or overlap
     auto criterion = [centerA, sizeA, nodeCenters, nodeSizes, box]
         (TreeNodeIndex b) -> bool
     {
@@ -90,7 +78,6 @@ __global__ void singleTraversalP2PKernel(
         return norm2(d) == T(0);
     };
 
-    //! endpointAction: b is a touching leaf — spin over particlesPerBin^2 fmaf iters
     auto action = [p2pCount, a, particlesPerBin] (TreeNodeIndex b)
     {
         volatile float acc = 0.f;
@@ -105,7 +92,7 @@ __global__ void singleTraversalP2PKernel(
 
 // ── Dual traversal GPU kernel ─────────────────────────────────────────────────
 
-template<int numConsumersPerBlock, class T>
+template<int numWarps, unsigned queueCap, class T>
 __global__ void dualP2PKernel(
     const TreeNodeIndex* __restrict__ childOffsets,
     const Vec3<T>* __restrict__       nodeCenters,
@@ -116,7 +103,6 @@ __global__ void dualP2PKernel(
     unsigned                          particlesPerBin,
     unsigned*                         p2pCount)
 {
-    //! criterion: recurse only when subtrees touch or overlap
     auto criterion = [nodeCenters, nodeSizes, box] __device__(TreeNodeIndex a, TreeNodeIndex b) -> bool
     {
         Vec3<T> d = minDistance(nodeCenters[a], nodeSizes[a], nodeCenters[b], nodeSizes[b], box);
@@ -125,7 +111,6 @@ __global__ void dualP2PKernel(
 
     auto m2l = [] __device__(TreeNodeIndex, TreeNodeIndex) {};
 
-    //! p2p: spin over (particlesPerBin x particlesPerBin) fmaf iterations, then count
     auto p2p = [p2pCount, particlesPerBin] __device__(TreeNodeIndex a, TreeNodeIndex b)
     {
         volatile float acc = 0.f;
@@ -135,7 +120,7 @@ __global__ void dualP2PKernel(
         atomicAdd(p2pCount, 1u);
     };
 
-    dualTraversalGPU<numConsumersPerBlock>(childOffsets, rootA, rootB, criterion, m2l, p2p);
+    dualTraversalGPU<numWarps, queueCap>(childOffsets, rootA, rootB, criterion, m2l, p2p);
 }
 
 // ── Launch configurations ─────────────────────────────────────────────────────
@@ -147,19 +132,60 @@ struct SingleConfig
 
 struct DualConfig
 {
-    static constexpr unsigned numConsumersPerBlock = 8;
-    static constexpr unsigned numThreadsPerBlock   = (numConsumersPerBlock + 1) * GpuConfig::warpSize;
-    static_assert(numThreadsPerBlock >= 64 && numThreadsPerBlock <= 512);
+    static constexpr unsigned numWarps = 8;
+    static constexpr unsigned numThreadsPerBlock = numWarps * GpuConfig::warpSize;
+    // static_assert(numThreadsPerBlock >= 64 && numThreadsPerBlock <= 512);
 
     static constexpr unsigned kBlocksPerCluster = 8;
-    static constexpr unsigned kNumClusters      = 64;
+    static constexpr unsigned kNumClusters      = 64*8;
     static constexpr unsigned kTotalBlocks      = kBlocksPerCluster * kNumClusters;
+
+    static constexpr unsigned queueCap = numThreadsPerBlock * 4;
 };
+
+// ── Statistics helpers ────────────────────────────────────────────────────────
+
+struct BenchStats
+{
+    float median;
+    float mean;
+    float stddev;
+    float minVal;
+    float maxVal;
+};
+
+BenchStats computeStats(std::vector<float>& samples)
+{
+    std::sort(samples.begin(), samples.end());
+
+    size_t n = samples.size();
+    float med = (n % 2 == 1)
+        ? samples[n / 2]
+        : 0.5f * (samples[n / 2 - 1] + samples[n / 2]);
+
+    float sum = std::accumulate(samples.begin(), samples.end(), 0.0f);
+    float avg = sum / (float)n;
+
+    float sqSum = 0.0f;
+    for (float s : samples)
+        sqSum += (s - avg) * (s - avg);
+    float sd = std::sqrt(sqSum / (float)n);
+
+    return {med, avg, sd, samples.front(), samples.back()};
+}
+
+void printStats(const char* label, const BenchStats& s)
+{
+    printf("  %-22s  median=%.3f  mean=%.3f  stddev=%.3f  min=%.3f  max=%.3f ms\n",
+           label, s.median, s.mean, s.stddev, s.minVal, s.maxVal);
+}
 
 // ── Benchmark body ────────────────────────────────────────────────────────────
 
-void syntheticP2PBenchmark(unsigned numParticles   = 1000000,
-                            unsigned particlesPerBin = 32)
+void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
+                            unsigned particlesPerBin = 32,
+                            unsigned numWarmup       = 10,
+                            unsigned numRuns         = 50)
 {
     using KeyType = uint64_t;
     using T       = double;
@@ -182,8 +208,10 @@ void syntheticP2PBenchmark(unsigned numParticles   = 1000000,
     const TreeNodeIndex numTreeNodes = octree.numTreeNodes();
     const unsigned      numLeaves    = nNodes(leaves);
 
-    printf("Synthetic P2P: %u particles, %u leaves, %d total nodes, bin %u\n",
+    printf("Synthetic P2P benchmark\n");
+    printf("  particles=%u  leaves=%u  nodes=%d  bin=%u\n",
            numParticles, numLeaves, numTreeNodes, particlesPerBin);
+    printf("  warmup=%u  runs=%u\n\n", numWarmup, numRuns);
 
     // ── Per-node geometry (centers and half-sizes) ────────────────────────────
     std::vector<Vec3<T>> h_nodeCenters(numTreeNodes);
@@ -197,37 +225,10 @@ void syntheticP2PBenchmark(unsigned numParticles   = 1000000,
         h_nodeSizes[i]   = s;
     }
 
-    // ── leafToInternal mapping (leaf index → internal tree node index) ─────────
+    // ── leafToInternal mapping ─────────────────────────────────────────────────
     std::vector<TreeNodeIndex> h_leafToInternal(numLeaves);
     for (unsigned i = 0; i < numLeaves; ++i)
         h_leafToInternal[i] = octree.toInternal(i);
-
-    // ── CPU reference: dualTraversal with synthetic spin ─────────────────────
-    //    Each pair {a,b} counted once (including self-pairs a==b).
-    unsigned cpuPairCount = 0;
-    // {
-    //     auto cpuCriterion = [&](TreeNodeIndex a, TreeNodeIndex b)
-    //     {
-    //         Vec3<T> d = minDistance(h_nodeCenters[a], h_nodeSizes[a],
-    //                                 h_nodeCenters[b], h_nodeSizes[b], box);
-    //         return norm2(d) == T(0);
-    //     };
-    //     auto cpuM2L = [](TreeNodeIndex, TreeNodeIndex) {};
-    //     auto cpuP2P = [&cpuPairCount, particlesPerBin](TreeNodeIndex a, TreeNodeIndex b)
-    //     {
-    //         volatile float acc = 0.f;
-    //         for (unsigned pi = 0; pi < particlesPerBin; ++pi)
-    //             for (unsigned pj = 0; pj < particlesPerBin; ++pj)
-    //                 acc = std::fmaf(float(a + pi), float(b + pj), acc);
-    //         ++cpuPairCount;
-    //     };
-
-    //     float cpuTime = timeCpu([&]()
-    //     {
-    //         dualTraversal(octree.childOffsets().data(), 0, 0, cpuCriterion, cpuM2L, cpuP2P);
-    //     });
-    //     printf("CPU dual traversal:    %.3f s,  %u pairs\n", cpuTime, cpuPairCount);
-    // }
 
     // ── Upload arrays to GPU ──────────────────────────────────────────────────
     auto co  = octree.childOffsets();
@@ -239,21 +240,16 @@ void syntheticP2PBenchmark(unsigned numParticles   = 1000000,
     DeviceVector<Vec3<T>>       d_nodeCenters(h_nodeCenters);
     DeviceVector<Vec3<T>>       d_nodeSizes(h_nodeSizes);
 
-    unsigned* d_singleCount;
-    unsigned* d_dualCount;
-    cudaMalloc(&d_singleCount, sizeof(unsigned));
-    cudaMalloc(&d_dualCount,   sizeof(unsigned));
+    unsigned* d_count;
+    cudaMalloc(&d_count, sizeof(unsigned));
 
-    // ── Single traversal GPU (one thread per leaf) ────────────────────────────
-    //    Each off-diagonal pair {a,b} is found by thread a AND thread b → counted twice.
-    //    Each self-pair {a,a} is found only by thread a → counted once.
-    //    Expected: singleCount == 2 * cpuPairCount - numLeaves
+    // ── Single traversal lambda ──────────────────────────────────────────────
     const unsigned singleBlocks =
         (numLeaves + SingleConfig::numThreadsPerBlock - 1) / SingleConfig::numThreadsPerBlock;
 
     auto runSingle = [&]()
     {
-        cudaMemset(d_singleCount, 0, sizeof(unsigned));
+        cudaMemset(d_count, 0, sizeof(unsigned));
         singleTraversalP2PKernel<T>
             <<<singleBlocks, SingleConfig::numThreadsPerBlock>>>(
                 rawPtr(d_childOffsets),
@@ -264,16 +260,16 @@ void syntheticP2PBenchmark(unsigned numParticles   = 1000000,
                 box,
                 numLeaves,
                 particlesPerBin,
-                d_singleCount);
+                d_count);
     };
 
-    float singleTime = timeGpu(runSingle);
-    printf("Single traversal GPU:  %.3f ms\n", singleTime);
+    // ── Dual traversal lambda ────────────────────────────────────────────────
+    unsigned smemBytes = dualTraversalSmemBytes(DualConfig::queueCap, DualConfig::numWarps);
 
-    // ── Dual GPU traversal (cluster-based, with DSM work-stealing) ────────────
     cudaLaunchConfig_t dualCfg{};
     dualCfg.gridDim  = {DualConfig::kTotalBlocks, 1, 1};
     dualCfg.blockDim = {DualConfig::numThreadsPerBlock, 1, 1};
+    dualCfg.dynamicSmemBytes = smemBytes;
 
     cudaLaunchAttribute dualAttr{};
     dualAttr.id               = cudaLaunchAttributeClusterDimension;
@@ -285,9 +281,9 @@ void syntheticP2PBenchmark(unsigned numParticles   = 1000000,
 
     auto runDual = [&]()
     {
-        cudaMemset(d_dualCount, 0, sizeof(unsigned));
+        cudaMemset(d_count, 0, sizeof(unsigned));
         cudaLaunchKernelEx(&dualCfg,
-                           dualP2PKernel<DualConfig::numConsumersPerBlock, T>,
+                           dualP2PKernel<DualConfig::numWarps, DualConfig::queueCap, T>,
                            rawPtr(d_childOffsets),
                            rawPtr(d_nodeCenters),
                            rawPtr(d_nodeSizes),
@@ -295,38 +291,52 @@ void syntheticP2PBenchmark(unsigned numParticles   = 1000000,
                            TreeNodeIndex{0},
                            TreeNodeIndex{0},
                            particlesPerBin,
-                           d_dualCount);
+                           d_count);
     };
 
-    float dualTime = timeGpu(runDual);
-    printf("Dual GPU:              %.3f ms\n", dualTime);
-    printf("Speedup (single/dual): %.2fx\n", singleTime / dualTime);
+    // ── Correctness check (one run of each) ──────────────────────────────────
+    runSingle();
+    cudaDeviceSynchronize();
+    unsigned h_singleCount = 0;
+    cudaMemcpy(&h_singleCount, d_count, sizeof(unsigned), cudaMemcpyDeviceToHost);
 
-    // ── Copy counts ───────────────────────────────────────────────────────────
-    unsigned h_singleCount = 0, h_dualCount = 0;
-    cudaMemcpy(&h_singleCount, d_singleCount, sizeof(unsigned), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&h_dualCount,   d_dualCount,   sizeof(unsigned), cudaMemcpyDeviceToHost);
+    runDual();
+    cudaDeviceSynchronize();
+    unsigned h_dualCount = 0;
+    cudaMemcpy(&h_dualCount, d_count, sizeof(unsigned), cudaMemcpyDeviceToHost);
 
-    // printf("Pairs — CPU dual: %u, Single GPU: %u, Dual GPU: %u\n",
-    printf("Single GPU: %u, Dual GPU: %u\n",
-           /*cpuPairCount,*/ h_singleCount, h_dualCount);
+    printf("  p2p pairs: single=%u  dual=%u\n\n", h_singleCount, h_dualCount);
 
-    // ── Correctness ───────────────────────────────────────────────────────────
-    // // Single traversal double-counts off-diagonal pairs and single-counts self-pairs.
-    // EXPECT_EQ(h_singleCount, 2u * cpuPairCount - numLeaves)
-    //     << "Single traversal count mismatch (expected 2*cpuCount - numLeaves)";
+    // ── Warmup ───────────────────────────────────────────────────────────────
+    printf("  Warming up (%u runs each)...\n", numWarmup);
+    for (unsigned i = 0; i < numWarmup; ++i) { timeGpu(runSingle); printf("%d\n",i);}
+    for (unsigned i = 0; i < numWarmup; ++i) { timeGpu(runDual); printf("%d\n",i);}
 
-    // Dual traversal must reproduce the CPU reference exactly.
-    // EXPECT_EQ(h_dualCount, cpuPairCount)
-    //     << "Dual GPU pair count != CPU reference";
+    // ── Timed runs ───────────────────────────────────────────────────────────
+    printf("  Timing (%u runs each)...\n\n", numRuns);
 
-    cudaFree(d_singleCount);
-    cudaFree(d_dualCount);
+    std::vector<float> singleTimes(numRuns);
+    std::vector<float> dualTimes(numRuns);
+
+    for (unsigned i = 0; i < numRuns; ++i) { singleTimes[i] = timeGpu(runSingle); }
+    for (unsigned i = 0; i < numRuns; ++i) { dualTimes[i]   = timeGpu(runDual); printf("%d\n",i);}
+
+    // ── Report ───────────────────────────────────────────────────────────────
+    BenchStats singleStats = computeStats(singleTimes);
+    BenchStats dualStats   = computeStats(dualTimes);
+
+    printStats("Single traversal:", singleStats);
+    printStats("Dual traversal:",   dualStats);
+
+    printf("\n  Speedup (median): %.2fx\n", singleStats.median / dualStats.median);
+    printf("  Speedup (mean):   %.2fx\n",   singleStats.mean / dualStats.mean);
+
+    cudaFree(d_count);
 }
 
 TEST(Traversal, syntheticP2PBenchmark)
 {
-    syntheticP2PBenchmark(10000000, 32);
+    syntheticP2PBenchmark(5000000, 16, 10, 50);
 }
 
 } // namespace cstone

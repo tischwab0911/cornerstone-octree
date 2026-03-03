@@ -39,7 +39,7 @@
 
 namespace cstone {
 
-template <int numConsumersPerBlock, class KeyType>
+template <class KeyType>
 __global__ void singleTraversalSurfaceCount(
     const TreeNodeIndex* __restrict__ childOffsets,
     const TreeNodeIndex* __restrict__ parents,
@@ -61,7 +61,6 @@ __global__ void singleTraversalSurfaceCount(
         return overlapTwoRanges(focusStart, focusEnd, codeStarts[i], codeEnds[i]);
     };
 
-    // Record each in-focus surface leaf as a self-pair {i, i} for later comparison
     auto endpointAction = [p2pPairs, p2pPairCount, focusStart, focusEnd, codeStarts, codeEnds]
                           __device__(TreeNodeIndex i)
     {
@@ -74,7 +73,7 @@ __global__ void singleTraversalSurfaceCount(
     singleTraversal(childOffsets, parents, isSurface, endpointAction);
 }
 
-template <int numConsumersPerBlock, class KeyType>
+template <int numWarps, unsigned queueCap, class KeyType>
 __global__ void dualTraversalSurfaceCount(
     const TreeNodeIndex* __restrict__ childOffsets,
     const KeyType* __restrict__ codeStarts,
@@ -115,42 +114,34 @@ __global__ void dualTraversalSurfaceCount(
         p2pPairs[idx][1] = b;
     };
 
-    dualTraversalGPU<numConsumersPerBlock>(childOffsets, rootA, rootB,
-                                           crossFocusSurfacePairs, m2l, p2p);
+    dualTraversalGPU<numWarps, queueCap>(childOffsets, rootA, rootB,
+                                        crossFocusSurfacePairs, m2l, p2p);
 }
 
 struct SingleTravConfig {
-    static constexpr unsigned numConsumersPerBlock = 1;
     static constexpr unsigned numThreadsPerBlock   = 1;
     static constexpr unsigned kTotalBlocks         = 1;
 };
 
 struct DualTravConfig {
 
-    //! @brief number of consumer warps ber block, all warps except warp 0 are consumers
-    static constexpr unsigned numConsumersPerBlock = 8;
+    static constexpr unsigned numWarps = 8;
 
-    /*! @brief number of threads per block for the traversal kernel
-     * number of threads per block for the dual traversal kernel
-     * must be at least 64 and at most 512
-     * must be a multiple of GPU warp size
-     */
-    static constexpr unsigned numThreadsPerBlock = (numConsumersPerBlock + 1) * GpuConfig::warpSize;
+    static constexpr unsigned numThreadsPerBlock = numWarps * GpuConfig::warpSize;
     static_assert(numThreadsPerBlock >= 64 && numThreadsPerBlock <= 512);
 
-    //! @brief number of blocks per thread block cluster, should be a power of 8: (1, 8, 64, ...)
+    //! @brief number of blocks per thread block cluster
     static constexpr unsigned kBlocksPerCluster = 8;
 
-    //! @brief number of TBS in grid, should be a power of 8: (1, 8, 64, ...)
+    //! @brief number of clusters in the grid
     static constexpr unsigned kNumClusters      = 64;
 
     //! @brief total number of blocks launched in the grid
     static constexpr unsigned kTotalBlocks      = kBlocksPerCluster * kNumClusters;
     static_assert(kBlocksPerCluster > 0 && kNumClusters > 0);
 
-    static constexpr unsigned ClusterStackSize = GpuConfig::warpSize * kBlocksPerCluster;
-    static constexpr unsigned OverflowLevel = GpuConfig::warpSize;
-
+    //! @brief per-queue capacity
+    static constexpr unsigned queueCap = numThreadsPerBlock * 4;
 };
 
 void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
@@ -163,7 +154,6 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
     // ── Build tree on CPU from Gaussian particles ────────────────
     RandomGaussianCoordinates<T, MortonKey<KeyType>> randomBox(numParticles, box);
 
-    // Sort particle keys and build the leaf-level octree on the CPU
     auto particleKeys = randomBox.particleKeys();
     std::sort(particleKeys.begin(), particleKeys.end());
 
@@ -203,9 +193,6 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
     DeviceVector<KeyType>       d_codeEnds(h_codeEnds);
     DeviceVector<unsigned>      d_levels(h_levels);
 
-    // ── Define focus region: first 1/8 of the SFC key space ──────
-    // This mirrors the CPU test which uses toInternal(0)..toInternal(8)
-    // For a uniform octree at level 1, that's the first octant.
     KeyType focusStart = 0;
     KeyType focusEnd   = nodeRange<KeyType>(0) / 8;
 
@@ -234,8 +221,6 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
     printf("CPU reference pairs: %zu\n", cpuPairs.size());
 
     // ── Allocate output buffers ──────────────────────────────────
-    // Surface pairs scale much better than all-pairs.
-    // Generous but bounded allocation.
     const unsigned pairBufSize = 1u << 24; // 16M pairs
 
     DeviceVector<util::array<TreeNodeIndex, 2>> d_singleP2P(pairBufSize);
@@ -250,12 +235,12 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
     cudaMalloc(&d_dualM2LCount,   sizeof(unsigned));
 
     // ── Dual traversal launch configuration (cluster-based) ──────
-    dim3 dualBlock(DualTravConfig::numThreadsPerBlock, 1, 1);
-    dim3 dualGrid(DualTravConfig::kTotalBlocks, 1, 1);
+    unsigned smemBytes = dualTraversalSmemBytes(DualTravConfig::queueCap, DualTravConfig::numWarps);
 
     cudaLaunchConfig_t dualCfg{};
-    dualCfg.gridDim  = dualGrid;
-    dualCfg.blockDim = dualBlock;
+    dualCfg.gridDim  = {DualTravConfig::kTotalBlocks, 1, 1};
+    dualCfg.blockDim = {DualTravConfig::numThreadsPerBlock, 1, 1};
+    dualCfg.dynamicSmemBytes = smemBytes;
 
     cudaLaunchAttribute dualAttr{};
     dualAttr.id               = cudaLaunchAttributeClusterDimension;
@@ -272,7 +257,7 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
     auto runSingle = [&]()
     {
         cudaMemset(d_singleP2PCount, 0, sizeof(unsigned));
-        singleTraversalSurfaceCount<SingleTravConfig::numConsumersPerBlock, KeyType>
+        singleTraversalSurfaceCount<KeyType>
             <<<SingleTravConfig::kTotalBlocks, SingleTravConfig::numThreadsPerBlock>>>(
                 rawPtr(d_childOffsets),
                 rawPtr(d_parents),
@@ -297,7 +282,7 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
         cudaMemset(d_dualP2PCount, 0, sizeof(unsigned));
         cudaMemset(d_dualM2LCount, 0, sizeof(unsigned));
         cudaLaunchKernelEx(&dualCfg,
-                           dualTraversalSurfaceCount<DualTravConfig::numConsumersPerBlock, KeyType>,
+                           dualTraversalSurfaceCount<DualTravConfig::numWarps, DualTravConfig::queueCap, KeyType>,
                            rawPtr(d_childOffsets),
                            rawPtr(d_codeStarts),
                            rawPtr(d_codeEnds),

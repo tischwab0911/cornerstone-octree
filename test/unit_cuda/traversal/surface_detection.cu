@@ -20,7 +20,6 @@
 #include <thrust/host_vector.h>
 #include <thrust/sequence.h>
 
-
 #include "gtest/gtest.h"
 #include "cstone/tree/octree_gpu.h"
 #include "cstone/tree/octree.hpp"
@@ -31,7 +30,7 @@
 
 namespace cstone {
 
-template <int numConsumersPerBlock, class KeyType>
+template <int numWarps, unsigned queueCap, class KeyType>
 __global__ void dualTraversalNeighborsCount(
     const TreeNodeIndex* __restrict__ childOffsets,
     const KeyType* __restrict__ codeStarts,
@@ -66,36 +65,29 @@ __global__ void dualTraversalNeighborsCount(
         p2pPairs[idx][1] = b;
     };
 
-    dualTraversalGPU<numConsumersPerBlock>(childOffsets, rootA, rootB,
-                                           crossFocusSurfacePairs, m2l, p2p);
+    dualTraversalGPU<numWarps, queueCap>(childOffsets, rootA, rootB,
+                                        crossFocusSurfacePairs, m2l, p2p);
 }
 
 struct TravConfig {
 
-    //! @brief number of consumer warps ber block, all warps except warp 0 are consumers
-    static constexpr unsigned numConsumersPerBlock = 3;
+    static constexpr unsigned numWarps = 4;
 
-    /*! @brief number of threads per block for the traversal kernel
-     * number of threads per block for the dual traversal kernel
-     * must be at least 64 and at most 512
-     * must be a multiple of GPU warp size
-     */
-    static constexpr unsigned numThreadsPerBlock = (numConsumersPerBlock + 1) * GpuConfig::warpSize;
+    static constexpr unsigned numThreadsPerBlock = numWarps * GpuConfig::warpSize;
     static_assert(numThreadsPerBlock >= 64 && numThreadsPerBlock <= 512);
 
-    //! @brief number of blocks per thread block cluster, should be a power of 8: (1, 8, 64, ...)
+    //! @brief number of blocks per thread block cluster
     static constexpr unsigned kBlocksPerCluster = 8;
 
-    //! @brief number of TBS in grid, should be a power of 8: (1, 8, 64, ...)
+    //! @brief number of clusters in the grid
     static constexpr unsigned kNumClusters      = 8;
 
     //! @brief total number of blocks launched in the grid
     static constexpr unsigned kTotalBlocks      = kBlocksPerCluster * kNumClusters;
     static_assert(kBlocksPerCluster > 0 && kNumClusters > 0);
 
-    static constexpr unsigned ClusterStackSize = GpuConfig::warpSize * kBlocksPerCluster;
-    static constexpr unsigned OverflowLevel = GpuConfig::warpSize;
-
+    //! @brief per-queue capacity
+    static constexpr unsigned queueCap = numThreadsPerBlock * 4;
 };
 
 
@@ -165,12 +157,12 @@ void dualTraversalNeighborsGpu()
     cudaMemset(d_p2pCount, 0, sizeof(unsigned));
 
     // ── Launch configuration ─────────────────────────────────────
-    dim3 block(TravConfig::numThreadsPerBlock, 1, 1);
-    dim3 grid(TravConfig::kTotalBlocks, 1, 1);
+    unsigned smemBytes = dualTraversalSmemBytes(TravConfig::queueCap, TravConfig::numWarps);
 
     cudaLaunchConfig_t cfg{};
-    cfg.gridDim  = grid;
-    cfg.blockDim = block;
+    cfg.gridDim  = {TravConfig::kTotalBlocks, 1, 1};
+    cfg.blockDim = {TravConfig::numThreadsPerBlock, 1, 1};
+    cfg.dynamicSmemBytes = smemBytes;
 
     cudaLaunchAttribute attr{};
     attr.id                = cudaLaunchAttributeClusterDimension;
@@ -182,7 +174,7 @@ void dualTraversalNeighborsGpu()
     cfg.numAttrs = 1;
 
     cudaLaunchKernelEx(&cfg,
-                       dualTraversalNeighborsCount<TravConfig::numConsumersPerBlock, KeyType>,
+                       dualTraversalNeighborsCount<TravConfig::numWarps, TravConfig::queueCap, KeyType>,
                        rawPtr(gpuTree.childOffsets),
                        rawPtr(d_codeStarts),
                        rawPtr(d_codeEnds),
