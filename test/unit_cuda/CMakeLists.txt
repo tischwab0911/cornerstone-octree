@@ -18,6 +18,7 @@ set(UNIT_TEST_SOURCES_GPU
 	traversal/large_surface_detection.cu
 	traversal/collision.cu
 	traversal/synthetic.cu
+	traversal/tune.cu
         tree/btree.cu
         tree/csarray.cu
         tree/octree.cu

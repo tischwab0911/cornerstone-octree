@@ -50,7 +50,7 @@
 namespace cstone
 {
 
-using DefaultTravConfig = TraversalConfig<1024>;
+using DefaultTravConfig = TraversalConfig<1024, 128, 640, 320, 192, 64, 256, 768, 256, 64>;
 
 // ── Single traversal GPU kernel ───────────────────────────────────────────────
 

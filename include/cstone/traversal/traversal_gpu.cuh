@@ -261,13 +261,13 @@ __device__ __forceinline__ bool ibStackPop(
 template<unsigned StackCap_,
          unsigned ChunkSize_       = StackCap_ / 8,
          unsigned ForcePush_       = StackCap_ * 5 / 8,
-         unsigned AttemptPush_     = StackCap_ * 3 / 8,
-         unsigned AttemptPop_      = StackCap_ / 4,
-         unsigned ForcePop_        = StackCap_ / 8,
-         unsigned TravChunkSize_   = StackCap_ / 8,
+         unsigned AttemptPush_     = StackCap_ * 5 / 16,
+         unsigned AttemptPop_      = StackCap_ * 3 / 16,
+         unsigned ForcePop_        = StackCap_ * 1 / 16,
+         unsigned TravChunkSize_   = StackCap_ / 4,
          unsigned TravForcePush_   = StackCap_ - 8 * GpuConfig::warpSize,
-         unsigned TravAttemptPush_ = StackCap_ * 4 / 8,
-         unsigned TravAttemptPop_  = StackCap_ * 2 / 8>
+         unsigned TravAttemptPush_ = StackCap_ * 1 / 4,
+         unsigned TravAttemptPop_  = StackCap_ * 1 / 16>
 struct TraversalConfig
 {
     //! @brief Shared-memory buffer capacity (node-pair slots)
@@ -441,6 +441,8 @@ __device__ __forceinline__ bool tryPushToGlobal(
 
     if (old != 0u) return false; // contention
 
+    // printf("Pushing to global: wHead=%u rHead=%u seg=%u\n", wHead, rHead, seg);
+
     unsigned base     = seg * chunk;
     unsigned count    = *bufCount;
     unsigned numPushed = min(chunk, count);
@@ -457,12 +459,12 @@ __device__ __forceinline__ bool tryPushToGlobal(
             gq.isP2P[base + i] = 2;
         }
     }
-    // __threadfence(); // ensure data visible to other blocks before signaling ready
+    __threadfence(); // ensure data visible to other blocks before signaling ready
     if (lane == 0) {
         atomicExch(&gq.segReady[seg], 2u);
         atomicSub(bufCount, numPushed);
     }
-    // __threadfence_block();
+    __threadfence_block();
     return true;
 }
 
@@ -590,10 +592,10 @@ __device__ __forceinline__ bool tryPushTraversalToGlobal(
         gq.nodeA[base + i] = bufA[srcIdx];
         gq.nodeB[base + i] = bufB[srcIdx];
     }
-    // __threadfence(); // ensure data visible to other blocks before signaling ready
+    __threadfence(); // ensure data visible to other blocks before signaling ready
     if (lane == 0) {
         atomicSub(bufCount, chunk);
-        // __threadfence();
+        __threadfence();
         atomicExch(&gq.segReady[seg], 2u);
     }
     return true;
@@ -649,7 +651,7 @@ __device__ __forceinline__ bool tryPopTraversalFromGlobal(
     __threadfence_block(); // ensure shared-mem writes visible before publishing count
     if(lane == 0) {
         atomicAdd(bufCount, chunk);
-        // __threadfence();
+        __threadfence();
         atomicExch(&gq.segReady[seg], 0u);
     }
     return true;
@@ -903,10 +905,10 @@ __device__ void dualTraversalBlock(
                 //            atomicAdd(globalQueue.writeHead, 0u), atomicAdd(globalQueue.readHead, 0u),
                 //            atomicAdd(numActiveProducers, 0u));
             }
-            // __syncwarp();
+            __syncwarp();
 
             // traversal push and pop logic
-            if (localStackTop >= TravConfig::travForcePush || (localStackTop + GpuConfig::warpSize * 8 > stackCap)) {
+            if (localStackTop >= TravConfig::travForcePush || (localStackTop + GpuConfig::warpSize * 8 >= stackCap)) {
                 tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, true);
             } else if (localStackTop > TravConfig::travAttemptPush) {
                 tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, false);
@@ -920,7 +922,7 @@ __device__ void dualTraversalBlock(
             } else if (localStackTop <= TravConfig::travAttemptPop) {
                 tryPopTraversalFromGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, false);
             }
-            // __syncwarp();
+            __syncwarp();
         }
         // if (tid == 0) printf("[PRODUCER blk=%u] exiting main loop\n", blockIdx.x);
         // __threadfence(); // ensure all IB/global-queue writes visible before signaling done
