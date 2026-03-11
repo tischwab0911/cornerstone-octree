@@ -73,7 +73,9 @@ __global__ void singleTraversalSurfaceCount(
     singleTraversal(childOffsets, parents, isSurface, endpointAction);
 }
 
-template <int numWarps, unsigned queueCap, class KeyType>
+using DefaultTravConfig = TraversalConfig<1024>;
+
+template <int numWarps, class KeyType>
 __global__ void dualTraversalSurfaceCount(
     const TreeNodeIndex* __restrict__ childOffsets,
     const KeyType* __restrict__ codeStarts,
@@ -87,7 +89,10 @@ __global__ void dualTraversalSurfaceCount(
     util::array<TreeNodeIndex, 2>* p2pPairs,
     util::array<TreeNodeIndex, 2>* m2lPairs,
     unsigned* p2pPairCount,
-    unsigned* m2lPairCount)
+    unsigned* m2lPairCount,
+    GlobalWorkQueue globalQueue,
+    GlobalTraversalQueue globalTraversalQueue,
+    unsigned* numActiveProducers)
 {
     auto crossFocusSurfacePairs =
         [focusStart, focusEnd, codeStarts, codeEnds, nodeLevels, box]
@@ -114,8 +119,10 @@ __global__ void dualTraversalSurfaceCount(
         p2pPairs[idx][1] = b;
     };
 
-    dualTraversalGPU<numWarps, queueCap>(childOffsets, rootA, rootB,
-                                        crossFocusSurfacePairs, m2l, p2p);
+    dualTraversalGPU<numWarps, DefaultTravConfig>(
+        childOffsets, rootA, rootB,
+        globalQueue, globalTraversalQueue, numActiveProducers,
+        crossFocusSurfacePairs, m2l, p2p);
 }
 
 struct SingleTravConfig {
@@ -125,7 +132,7 @@ struct SingleTravConfig {
 
 struct DualTravConfig {
 
-    static constexpr unsigned numWarps = 8;
+    static constexpr unsigned numWarps = 4;
 
     static constexpr unsigned numThreadsPerBlock = numWarps * GpuConfig::warpSize;
     static_assert(numThreadsPerBlock >= 64 && numThreadsPerBlock <= 512);
@@ -140,8 +147,8 @@ struct DualTravConfig {
     static constexpr unsigned kTotalBlocks      = kBlocksPerCluster * kNumClusters;
     static_assert(kBlocksPerCluster > 0 && kNumClusters > 0);
 
-    //! @brief per-queue capacity
-    static constexpr unsigned queueCap = numThreadsPerBlock * 4;
+    //! @brief per-block shared memory capacity (derived from TraversalConfig)
+    static constexpr unsigned stackCap = DefaultTravConfig::stackCap;
 };
 
 void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
@@ -234,13 +241,39 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
     cudaMalloc(&d_dualP2PCount,   sizeof(unsigned));
     cudaMalloc(&d_dualM2LCount,   sizeof(unsigned));
 
-    // ── Dual traversal launch configuration (cluster-based) ──────
-    // unsigned smemBytes = dualTraversalSmemBytes(DualTravConfig::queueCap, DualTravConfig::numWarps);
+    // ── Global work buffer ──
+    constexpr unsigned gChunk = DefaultTravConfig::chunkSize;
+    constexpr unsigned gSegs  = 1024;
+    constexpr unsigned gCap   = gSegs * gChunk;
+    TreeNodeIndex* d_gA; cudaMalloc(&d_gA, gCap * sizeof(TreeNodeIndex));
+    TreeNodeIndex* d_gB; cudaMalloc(&d_gB, gCap * sizeof(TreeNodeIndex));
+    int* d_gP2P;         cudaMalloc(&d_gP2P, gCap * sizeof(int));
+    unsigned* d_wHead;   cudaMalloc(&d_wHead, sizeof(unsigned));
+    unsigned* d_rHead;   cudaMalloc(&d_rHead, sizeof(unsigned));
+    unsigned* d_segR;    cudaMalloc(&d_segR, gSegs * sizeof(unsigned));
+    unsigned* d_nProd;   cudaMalloc(&d_nProd, sizeof(unsigned));
+    GlobalWorkQueue gq{d_gA, d_gB, d_gP2P, d_wHead, d_rHead, d_segR, gSegs};
 
+    // Global traversal queue
+    constexpr unsigned tChunk = DefaultTravConfig::travChunkSize;
+    constexpr unsigned tSegs  = 1024;
+    constexpr unsigned tCap   = tSegs * tChunk;
+    TreeNodeIndex* d_tA;  cudaMalloc(&d_tA, tCap * sizeof(TreeNodeIndex));
+    TreeNodeIndex* d_tB;  cudaMalloc(&d_tB, tCap * sizeof(TreeNodeIndex));
+    unsigned* d_twHead;   cudaMalloc(&d_twHead, sizeof(unsigned));
+    unsigned* d_trHead;   cudaMalloc(&d_trHead, sizeof(unsigned));
+    unsigned* d_tsegR;    cudaMalloc(&d_tsegR, tSegs * sizeof(unsigned));
+    GlobalTraversalQueue tq{d_tA, d_tB, d_twHead, d_trHead, d_tsegR, tSegs};
+
+    unsigned maxBlocks = maxConcurrentBlocks(
+        dualTraversalSurfaceCount<DualTravConfig::numWarps, KeyType>,
+        DualTravConfig::numThreadsPerBlock, DualTravConfig::kBlocksPerCluster);
+    unsigned dualTotalBlocks = std::min(DualTravConfig::kTotalBlocks, maxBlocks);
+
+    // ── Dual traversal launch configuration (cluster-based) ──────
     cudaLaunchConfig_t dualCfg{};
-    dualCfg.gridDim  = {DualTravConfig::kTotalBlocks, 1, 1};
+    dualCfg.gridDim  = {dualTotalBlocks, 1, 1};
     dualCfg.blockDim = {DualTravConfig::numThreadsPerBlock, 1, 1};
-    // dualCfg.dynamicSmemBytes = smemBytes;
 
     cudaLaunchAttribute dualAttr{};
     dualAttr.id               = cudaLaunchAttributeClusterDimension;
@@ -281,8 +314,15 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
     {
         cudaMemset(d_dualP2PCount, 0, sizeof(unsigned));
         cudaMemset(d_dualM2LCount, 0, sizeof(unsigned));
+        cudaMemset(d_wHead, 0, sizeof(unsigned));
+        cudaMemset(d_rHead, 0, sizeof(unsigned));
+        cudaMemset(d_segR, 0, gSegs * sizeof(unsigned));
+        cudaMemset(d_twHead, 0, sizeof(unsigned));
+        cudaMemset(d_trHead, 0, sizeof(unsigned));
+        cudaMemset(d_tsegR, 0, tSegs * sizeof(unsigned));
+        cudaMemcpy(d_nProd, &dualTotalBlocks, sizeof(unsigned), cudaMemcpyHostToDevice);
         cudaLaunchKernelEx(&dualCfg,
-                           dualTraversalSurfaceCount<DualTravConfig::numWarps, DualTravConfig::queueCap, KeyType>,
+                           dualTraversalSurfaceCount<DualTravConfig::numWarps, KeyType>,
                            rawPtr(d_childOffsets),
                            rawPtr(d_codeStarts),
                            rawPtr(d_codeEnds),
@@ -294,7 +334,10 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
                            rawPtr(d_dualP2P),
                            rawPtr(d_dualM2L),
                            d_dualP2PCount,
-                           d_dualM2LCount);
+                           d_dualM2LCount,
+                           gq,
+                           tq,
+                           d_nProd);
     };
 
     float dualTime = timeGpu(runDual);
@@ -372,6 +415,18 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
     cudaFree(d_singleP2PCount);
     cudaFree(d_dualP2PCount);
     cudaFree(d_dualM2LCount);
+    cudaFree(d_gA);
+    cudaFree(d_gB);
+    cudaFree(d_gP2P);
+    cudaFree(d_wHead);
+    cudaFree(d_rHead);
+    cudaFree(d_segR);
+    cudaFree(d_nProd);
+    cudaFree(d_tA);
+    cudaFree(d_tB);
+    cudaFree(d_twHead);
+    cudaFree(d_trHead);
+    cudaFree(d_tsegR);
 }
 
 TEST(Traversal, dualVsSingleSurfaceGpu)

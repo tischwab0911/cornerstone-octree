@@ -31,14 +31,19 @@
 namespace cstone
 {
 
-template<int numWarps, unsigned queueCap>
+using DefaultTravConfig = TraversalConfig<1024, 256, 512, 384, 128, 768, 128, 512, 384, 16>;
+
+template<int numWarps>
 __global__ void dualTraversalCount(const TreeNodeIndex* __restrict__ childOffsets,
                                         TreeNodeIndex rootA,
                                         TreeNodeIndex rootB,
                                         util::array<TreeNodeIndex, 2>* p2pPairs,
                                         util::array<TreeNodeIndex, 2>* m2lPairs,
                                         unsigned* p2pPairCount,
-                                        unsigned* m2lPairCount)
+                                        unsigned* m2lPairCount,
+                                        GlobalWorkQueue globalQueue,
+                                        GlobalTraversalQueue globalTraversalQueue,
+                                        unsigned* numActiveProducers)
 {
     // admissibility criterion: accept all internal node pairs
     auto allPairs = [] __device__(TreeNodeIndex, TreeNodeIndex) { return true; };
@@ -57,9 +62,10 @@ __global__ void dualTraversalCount(const TreeNodeIndex* __restrict__ childOffset
         p2pPairs[idx][1] = b;
     };
 
-
-    dualTraversalGPU<numWarps, queueCap>(childOffsets, rootA, rootB,
-                         allPairs, m2l, p2p);
+    dualTraversalGPU<numWarps, DefaultTravConfig>(
+        childOffsets, rootA, rootB,
+        globalQueue, globalTraversalQueue, numActiveProducers,
+        allPairs, m2l, p2p);
 }
 
 struct TravConfig {
@@ -79,8 +85,8 @@ struct TravConfig {
     static constexpr unsigned kTotalBlocks      = kBlocksPerCluster * kNumClusters;
     static_assert(kBlocksPerCluster > 0 && kNumClusters > 0);
 
-    //! @brief per-queue capacity (number of node-pair slots)
-    static constexpr unsigned queueCap = numThreadsPerBlock * 4;
+    //! @brief per-block shared memory capacity (node-pair slots)
+    static constexpr unsigned stackCap = DefaultTravConfig::stackCap;
 };
 
 template <class KeyType>
@@ -127,14 +133,45 @@ void dualTraversalAllPairsGpu()
     cudaMemset(d_p2pCount, 0, sizeof(unsigned));
     cudaMemset(d_m2lCount, 0, sizeof(unsigned));
 
-    // Compute dynamic shared memory size
-    // unsigned smemBytes = dualTraversalSmemBytes(TravConfig::queueCap, TravConfig::numWarps);
+    // Global work buffer
+    constexpr unsigned gChunk = DefaultTravConfig::chunkSize;
+    constexpr unsigned gSegs  = 256;
+    constexpr unsigned gCap   = gSegs * gChunk;
+    TreeNodeIndex* d_gA; cudaMalloc(&d_gA, gCap * sizeof(TreeNodeIndex));
+    TreeNodeIndex* d_gB; cudaMalloc(&d_gB, gCap * sizeof(TreeNodeIndex));
+    int* d_gP2P;         cudaMalloc(&d_gP2P, gCap * sizeof(int));
+    unsigned* d_wHead;   cudaMalloc(&d_wHead, sizeof(unsigned));
+    unsigned* d_rHead;   cudaMalloc(&d_rHead, sizeof(unsigned));
+    unsigned* d_segR;    cudaMalloc(&d_segR, gSegs * sizeof(unsigned));
+    unsigned* d_nProd;   cudaMalloc(&d_nProd, sizeof(unsigned));
+    cudaMemset(d_wHead, 0, sizeof(unsigned));
+    cudaMemset(d_rHead, 0, sizeof(unsigned));
+    cudaMemset(d_segR, 0, gSegs * sizeof(unsigned));
+    unsigned maxBlocks = maxConcurrentBlocks(
+        dualTraversalCount<TravConfig::numWarps>,
+        TravConfig::numThreadsPerBlock, TravConfig::kBlocksPerCluster);
+    unsigned totalBlocks = std::min(TravConfig::kTotalBlocks, maxBlocks);
+    cudaMemcpy(d_nProd, &totalBlocks, sizeof(unsigned), cudaMemcpyHostToDevice);
+    GlobalWorkQueue gq{d_gA, d_gB, d_gP2P, d_wHead, d_rHead, d_segR, gSegs};
+
+    // Global traversal work buffer
+    constexpr unsigned tChunk = DefaultTravConfig::travChunkSize;
+    constexpr unsigned tSegs  = 256;
+    constexpr unsigned tCap   = tSegs * tChunk;
+    TreeNodeIndex* d_tA; cudaMalloc(&d_tA, tCap * sizeof(TreeNodeIndex));
+    TreeNodeIndex* d_tB; cudaMalloc(&d_tB, tCap * sizeof(TreeNodeIndex));
+    unsigned* d_twHead;  cudaMalloc(&d_twHead, sizeof(unsigned));
+    unsigned* d_trHead;  cudaMalloc(&d_trHead, sizeof(unsigned));
+    unsigned* d_tsegR;   cudaMalloc(&d_tsegR, tSegs * sizeof(unsigned));
+    cudaMemset(d_twHead, 0, sizeof(unsigned));
+    cudaMemset(d_trHead, 0, sizeof(unsigned));
+    cudaMemset(d_tsegR, 0, tSegs * sizeof(unsigned));
+    GlobalTraversalQueue tq{d_tA, d_tB, d_twHead, d_trHead, d_tsegR, tSegs};
 
     // Cluster launch configuration
     cudaLaunchConfig_t cfg{};
-    cfg.gridDim   = {TravConfig::kTotalBlocks, 1, 1};
+    cfg.gridDim   = {totalBlocks, 1, 1};
     cfg.blockDim  = {TravConfig::numThreadsPerBlock, 1, 1};
-    // cfg.dynamicSmemBytes = smemBytes;
 
     cudaLaunchAttribute attr{};
     attr.id = cudaLaunchAttributeClusterDimension;
@@ -145,8 +182,8 @@ void dualTraversalAllPairsGpu()
     cfg.attrs    = &attr;
     cfg.numAttrs = 1;
 
-    cudaLaunchKernelEx(&cfg, dualTraversalCount<TravConfig::numWarps, TravConfig::queueCap>,
-                       rawPtr(gpuTree.childOffsets), 0, 0, rawPtr(d_p2pPairs), rawPtr(d_m2lPairs), d_p2pCount, d_m2lCount);
+    cudaLaunchKernelEx(&cfg, dualTraversalCount<TravConfig::numWarps>,
+                       rawPtr(gpuTree.childOffsets), 0, 0, rawPtr(d_p2pPairs), rawPtr(d_m2lPairs), d_p2pCount, d_m2lCount, gq, tq, d_nProd);
 
     cudaDeviceSynchronize();
 
@@ -190,6 +227,18 @@ void dualTraversalAllPairsGpu()
 
     cudaFree(d_p2pCount);
     cudaFree(d_m2lCount);
+    cudaFree(d_gA);
+    cudaFree(d_gB);
+    cudaFree(d_gP2P);
+    cudaFree(d_wHead);
+    cudaFree(d_rHead);
+    cudaFree(d_segR);
+    cudaFree(d_nProd);
+    cudaFree(d_tA);
+    cudaFree(d_tB);
+    cudaFree(d_twHead);
+    cudaFree(d_trHead);
+    cudaFree(d_tsegR);
 }
 
 TEST(Traversal, dualTraversalAllPairsGpu)

@@ -50,6 +50,8 @@
 namespace cstone
 {
 
+using DefaultTravConfig = TraversalConfig<1024>;
+
 // ── Single traversal GPU kernel ───────────────────────────────────────────────
 
 template<class T>
@@ -92,7 +94,7 @@ __global__ void singleTraversalP2PKernel(
 
 // ── Dual traversal GPU kernel ─────────────────────────────────────────────────
 
-template<int numWarps, unsigned queueCap, class T>
+template<int numWarps, class T>
 __global__ void dualP2PKernel(
     const TreeNodeIndex* __restrict__ childOffsets,
     const Vec3<T>* __restrict__       nodeCenters,
@@ -101,7 +103,10 @@ __global__ void dualP2PKernel(
     TreeNodeIndex                     rootA,
     TreeNodeIndex                     rootB,
     unsigned                          particlesPerBin,
-    unsigned*                         p2pCount)
+    unsigned*                         p2pCount,
+    GlobalWorkQueue                   globalQueue,
+    GlobalTraversalQueue              globalTraversalQueue,
+    unsigned*                         numActiveProducers)
 {
     auto criterion = [nodeCenters, nodeSizes, box] __device__(TreeNodeIndex a, TreeNodeIndex b) -> bool
     {
@@ -120,7 +125,10 @@ __global__ void dualP2PKernel(
         atomicAdd(p2pCount, 1u);
     };
 
-    dualTraversalGPU<numWarps, queueCap>(childOffsets, rootA, rootB, criterion, m2l, p2p);
+    dualTraversalGPU<numWarps, DefaultTravConfig>(
+        childOffsets, rootA, rootB,
+        globalQueue, globalTraversalQueue, numActiveProducers,
+        criterion, m2l, p2p);
 }
 
 // ── Launch configurations ─────────────────────────────────────────────────────
@@ -132,15 +140,16 @@ struct SingleConfig
 
 struct DualConfig
 {
-    static constexpr unsigned numWarps = 8;
+    static constexpr unsigned numWarps = 4;
     static constexpr unsigned numThreadsPerBlock = numWarps * GpuConfig::warpSize;
     // static_assert(numThreadsPerBlock >= 64 && numThreadsPerBlock <= 512);
 
     static constexpr unsigned kBlocksPerCluster = 8;
-    static constexpr unsigned kNumClusters      = 64*8;
+    static constexpr unsigned kNumClusters      = 64;
     static constexpr unsigned kTotalBlocks      = kBlocksPerCluster * kNumClusters;
 
-    static constexpr unsigned queueCap = numThreadsPerBlock * 4;
+    //! @brief per-block shared memory capacity (derived from TraversalConfig)
+    static constexpr unsigned stackCap = DefaultTravConfig::stackCap;
 };
 
 // ── Statistics helpers ────────────────────────────────────────────────────────
@@ -263,13 +272,40 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
                 d_count);
     };
 
-    // ── Dual traversal lambda ────────────────────────────────────────────────
-    // unsigned smemBytes = dualTraversalSmemBytes(DualConfig::queueCap, DualConfig::numWarps);
+    // ── Global work buffer ──
+    constexpr unsigned gChunk = DefaultTravConfig::chunkSize;
+    constexpr unsigned gSegs  = 1024;
+    constexpr unsigned gCap   = gSegs * gChunk;
+    TreeNodeIndex* d_gA; cudaMalloc(&d_gA, gCap * sizeof(TreeNodeIndex));
+    TreeNodeIndex* d_gB; cudaMalloc(&d_gB, gCap * sizeof(TreeNodeIndex));
+    int* d_gP2P;         cudaMalloc(&d_gP2P, gCap * sizeof(int));
+    unsigned* d_wHead;   cudaMalloc(&d_wHead, sizeof(unsigned));
+    unsigned* d_rHead;   cudaMalloc(&d_rHead, sizeof(unsigned));
+    unsigned* d_segR;    cudaMalloc(&d_segR, gSegs * sizeof(unsigned));
+    unsigned* d_nProd;   cudaMalloc(&d_nProd, sizeof(unsigned));
+    GlobalWorkQueue gq{d_gA, d_gB, d_gP2P, d_wHead, d_rHead, d_segR, gSegs};
 
+    // Global traversal queue
+    constexpr unsigned tChunk = DefaultTravConfig::travChunkSize;
+    constexpr unsigned tSegs  = 1024;
+    constexpr unsigned tCap   = tSegs * tChunk;
+    TreeNodeIndex* d_tA;  cudaMalloc(&d_tA, tCap * sizeof(TreeNodeIndex));
+    TreeNodeIndex* d_tB;  cudaMalloc(&d_tB, tCap * sizeof(TreeNodeIndex));
+    unsigned* d_twHead;   cudaMalloc(&d_twHead, sizeof(unsigned));
+    unsigned* d_trHead;   cudaMalloc(&d_trHead, sizeof(unsigned));
+    unsigned* d_tsegR;    cudaMalloc(&d_tsegR, tSegs * sizeof(unsigned));
+    GlobalTraversalQueue tq{d_tA, d_tB, d_twHead, d_trHead, d_tsegR, tSegs};
+
+    unsigned maxBlocks = maxConcurrentBlocks(
+        dualP2PKernel<DualConfig::numWarps, T>,
+        DualConfig::numThreadsPerBlock, DualConfig::kBlocksPerCluster);
+    unsigned dualTotalBlocks = std::min(DualConfig::kTotalBlocks, maxBlocks);
+    printf("Max concurrent blocks for dual traversal: %u (configured %u)\n", maxBlocks, DualConfig::kTotalBlocks);
+
+    // ── Dual traversal lambda ────────────────────────────────────────────────
     cudaLaunchConfig_t dualCfg{};
-    dualCfg.gridDim  = {DualConfig::kTotalBlocks, 1, 1};
+    dualCfg.gridDim  = {dualTotalBlocks, 1, 1};
     dualCfg.blockDim = {DualConfig::numThreadsPerBlock, 1, 1};
-    // dualCfg.dynamicSmemBytes = smemBytes;
 
     cudaLaunchAttribute dualAttr{};
     dualAttr.id               = cudaLaunchAttributeClusterDimension;
@@ -282,8 +318,15 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
     auto runDual = [&]()
     {
         cudaMemset(d_count, 0, sizeof(unsigned));
+        cudaMemset(d_wHead, 0, sizeof(unsigned));
+        cudaMemset(d_rHead, 0, sizeof(unsigned));
+        cudaMemset(d_segR, 0, gSegs * sizeof(unsigned));
+        cudaMemset(d_twHead, 0, sizeof(unsigned));
+        cudaMemset(d_trHead, 0, sizeof(unsigned));
+        cudaMemset(d_tsegR, 0, tSegs * sizeof(unsigned));
+        cudaMemcpy(d_nProd, &dualTotalBlocks, sizeof(unsigned), cudaMemcpyHostToDevice);
         cudaLaunchKernelEx(&dualCfg,
-                           dualP2PKernel<DualConfig::numWarps, DualConfig::queueCap, T>,
+                           dualP2PKernel<DualConfig::numWarps, T>,
                            rawPtr(d_childOffsets),
                            rawPtr(d_nodeCenters),
                            rawPtr(d_nodeSizes),
@@ -291,7 +334,10 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
                            TreeNodeIndex{0},
                            TreeNodeIndex{0},
                            particlesPerBin,
-                           d_count);
+                           d_count,
+                           gq,
+                           tq,
+                           d_nProd);
     };
 
     // ── Correctness check (one run of each) ──────────────────────────────────
@@ -332,6 +378,18 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
     printf("  Speedup (mean):   %.2fx\n",   singleStats.mean / dualStats.mean);
 
     cudaFree(d_count);
+    cudaFree(d_gA);
+    cudaFree(d_gB);
+    cudaFree(d_gP2P);
+    cudaFree(d_wHead);
+    cudaFree(d_rHead);
+    cudaFree(d_segR);
+    cudaFree(d_nProd);
+    cudaFree(d_tA);
+    cudaFree(d_tB);
+    cudaFree(d_twHead);
+    cudaFree(d_trHead);
+    cudaFree(d_tsegR);
 }
 
 TEST(Traversal, syntheticP2PBenchmark)
