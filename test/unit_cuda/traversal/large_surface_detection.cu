@@ -247,12 +247,13 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
     constexpr unsigned gCap   = gSegs * gChunk;
     TreeNodeIndex* d_gA; cudaMalloc(&d_gA, gCap * sizeof(TreeNodeIndex));
     TreeNodeIndex* d_gB; cudaMalloc(&d_gB, gCap * sizeof(TreeNodeIndex));
-    int* d_gP2P;         cudaMalloc(&d_gP2P, gCap * sizeof(int));
+    int* d_gIsP2P;       cudaMalloc(&d_gIsP2P, gCap * sizeof(int));
     unsigned* d_wHead;   cudaMalloc(&d_wHead, sizeof(unsigned));
     unsigned* d_rHead;   cudaMalloc(&d_rHead, sizeof(unsigned));
+    unsigned* d_segCount; cudaMalloc(&d_segCount, gSegs * sizeof(unsigned));
     unsigned* d_segR;    cudaMalloc(&d_segR, gSegs * sizeof(unsigned));
     unsigned* d_nProd;   cudaMalloc(&d_nProd, sizeof(unsigned));
-    GlobalWorkQueue gq{d_gA, d_gB, d_gP2P, d_wHead, d_rHead, d_segR, gSegs};
+    GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wHead, d_rHead, d_segCount, d_segR, gSegs};
 
     // Global traversal queue
     constexpr unsigned tChunk = DefaultTravConfig::travChunkSize;
@@ -316,6 +317,7 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
         cudaMemset(d_dualM2LCount, 0, sizeof(unsigned));
         cudaMemset(d_wHead, 0, sizeof(unsigned));
         cudaMemset(d_rHead, 0, sizeof(unsigned));
+        cudaMemset(d_segCount, 0, gSegs * sizeof(unsigned));
         cudaMemset(d_segR, 0, gSegs * sizeof(unsigned));
         cudaMemset(d_twHead, 0, sizeof(unsigned));
         cudaMemset(d_trHead, 0, sizeof(unsigned));
@@ -417,9 +419,10 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
     cudaFree(d_dualM2LCount);
     cudaFree(d_gA);
     cudaFree(d_gB);
-    cudaFree(d_gP2P);
+    cudaFree(d_gIsP2P);
     cudaFree(d_wHead);
     cudaFree(d_rHead);
+    cudaFree(d_segCount);
     cudaFree(d_segR);
     cudaFree(d_nProd);
     cudaFree(d_tA);

@@ -86,15 +86,15 @@ struct TuneParams
 static constexpr TuneParams defaults(unsigned sc)
 {
     return {sc,
-            sc / 4,                          // chunkSize
-            sc * 5 / 8,                      // forcePush
-            sc * 5 / 16,                     // attemptPush
-            sc * 3 / 16,                     // attemptPop
-            sc * 1 / 16,                     // forcePop
-            sc / 4,                          // travChunkSize
+            128,                          // chunkSize
+            640,                      // forcePush
+            448,                     // attemptPush
+            192,                     // attemptPop
+            64,                     // forcePop
+            256,                          // travChunkSize
             sc - 8 * GpuConfig::warpSize,    // travForcePush
-            sc * 1 / 4,                     // travAttemptPush
-            sc * 1 / 32};                    // travAttemptPop
+            256,                     // travAttemptPush
+            32};                    // travAttemptPop
 }
 
 //  Modifier helpers — create a variant from an existing config:
@@ -119,6 +119,7 @@ static constexpr TuneParams tuneConfigs[] = {
     // defaults(512),
     // defaults(768),
     defaults(1024),
+    defaults(1280),
     // defaults(1536),
 
     // ── Interaction: vary chunkSize (base: defaults(1024)) ──
@@ -134,18 +135,20 @@ static constexpr TuneParams tuneConfigs[] = {
 
     // ── Interaction: vary attemptPush ──
     withAttemptPush(defaults(1024), 192),
-    withAttemptPush(defaults(1024), 448),
+    // withAttemptPush(defaults(1024), 448),
     withAttemptPush(defaults(1024), 576),
 
     // ── Interaction: vary attemptPop ──
     withAttemptPop(defaults(1024), 64),
     withAttemptPop(defaults(1024), 128),
+    withAttemptPop(defaults(1024), 256),
     withAttemptPop(defaults(1024), 320),
 
     // ── Interaction: vary forcePop ──
     withForcePop(defaults(1024), 32),
+    withForcePop(defaults(1024), 96),
     withForcePop(defaults(1024), 128),
-    withForcePop(defaults(1024), 192),
+    // withForcePop(defaults(1024), 192),
 
     // ── Traversal: vary travChunkSize ──
     // withTravChunkSize(defaults(1024), 64),
@@ -158,11 +161,12 @@ static constexpr TuneParams tuneConfigs[] = {
 
     // ── Traversal: vary travAttemptPush ──
     // withTravAttemptPush(defaults(1024), 128),
-    // withTravAttemptPush(defaults(1024), 384),
+    // withTravAttemptPush(defaults(1024), 320),
     // withTravAttemptPush(defaults(1024), 512),
 
     // ── Traversal: vary travAttemptPop ──
     // withTravAttemptPop(defaults(1024), 32),
+    withTravAttemptPop(defaults(1024), 50),
     // withTravAttemptPop(defaults(1024), 128),
     // withTravAttemptPop(defaults(1024), 192),
 };
@@ -201,6 +205,8 @@ struct TuneResult
     int        totalBlocks;
     bool       valid;
     unsigned   p2pCount;
+    unsigned   iactWHead, iactRHead;   // interaction queue write/read heads
+    unsigned   travWHead, travRHead;   // traversal queue write/read heads
     TuneStats  stats;
 };
 
@@ -333,16 +339,17 @@ TuneResult benchOne(
     constexpr unsigned gCap   = gSegs * gChunk;
 
     TreeNodeIndex *d_gA, *d_gB;
-    int* d_gP2P;
-    unsigned *d_wH, *d_rH, *d_sR, *d_nP;
+    int *d_gIsP2P;
+    unsigned *d_wH, *d_rH, *d_segCount, *d_sR, *d_nP;
     cudaMalloc(&d_gA,   gCap * sizeof(TreeNodeIndex));
     cudaMalloc(&d_gB,   gCap * sizeof(TreeNodeIndex));
-    cudaMalloc(&d_gP2P, gCap * sizeof(int));
+    cudaMalloc(&d_gIsP2P, gCap * sizeof(int));
     cudaMalloc(&d_wH,   sizeof(unsigned));
     cudaMalloc(&d_rH,   sizeof(unsigned));
+    cudaMalloc(&d_segCount, gSegs * sizeof(unsigned));
     cudaMalloc(&d_sR,   gSegs * sizeof(unsigned));
     cudaMalloc(&d_nP,   sizeof(unsigned));
-    GlobalWorkQueue gq{d_gA, d_gB, d_gP2P, d_wH, d_rH, d_sR, gSegs};
+    GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wH, d_rH, d_segCount, d_sR, gSegs};
 
     // ── Allocate global traversal queue ──
     constexpr unsigned tChunk = TravConfig::travChunkSize;
@@ -374,6 +381,7 @@ TuneResult benchOne(
         cudaMemset(d_count, 0, sizeof(unsigned));
         cudaMemset(d_wH,  0, sizeof(unsigned));
         cudaMemset(d_rH,  0, sizeof(unsigned));
+        cudaMemset(d_segCount, 0, gSegs * sizeof(unsigned));
         cudaMemset(d_sR,  0, gSegs * sizeof(unsigned));
         cudaMemset(d_twH, 0, sizeof(unsigned));
         cudaMemset(d_trH, 0, sizeof(unsigned));
@@ -393,6 +401,10 @@ TuneResult benchOne(
     if (err == cudaSuccess)
     {
         cudaMemcpy(&res.p2pCount, d_count, sizeof(unsigned), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&res.iactWHead, d_wH, sizeof(unsigned), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&res.iactRHead, d_rH, sizeof(unsigned), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&res.travWHead, d_twH, sizeof(unsigned), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&res.travRHead, d_trH, sizeof(unsigned), cudaMemcpyDeviceToHost);
 
         for (unsigned i = 0; i < nWarm; ++i) timeGpu(run);
 
@@ -406,8 +418,8 @@ TuneResult benchOne(
         cudaGetLastError();
     }
 
-    cudaFree(d_gA); cudaFree(d_gB); cudaFree(d_gP2P);
-    cudaFree(d_wH); cudaFree(d_rH); cudaFree(d_sR); cudaFree(d_nP);
+    cudaFree(d_gA); cudaFree(d_gB); cudaFree(d_gIsP2P);
+    cudaFree(d_wH); cudaFree(d_rH); cudaFree(d_segCount); cudaFree(d_sR); cudaFree(d_nP);
     cudaFree(d_tA); cudaFree(d_tB);
     cudaFree(d_twH); cudaFree(d_trH); cudaFree(d_tsR);
     return res;
@@ -599,9 +611,9 @@ void tuneP2PBenchmark(unsigned numParticles    = 5000000,
            "════════════════════════════════════\n");
     printf("  Single traversal baseline: median=%.3f ms\n\n", singleStats.median);
     printf("  nW |   SC  | iCS  iFP  iAP iAPo iFPo | tCS  tFP  tAP tAPo | blks |"
-           "  median    mean  stddev     min     max  | p2p       | speedup\n");
+           "  median    mean  stddev     min     max  | p2p       | iW/iR       tW/tR       | speedup\n");
     printf("  ---+-------+-------------------------+---------------------+------+"
-           "------------------------------------------+-----------+---------\n");
+           "------------------------------------------+-----------+-------------------------+---------\n");
 
     float bestMedian = 1e30f;
     int bestIdx = -1;
@@ -613,7 +625,7 @@ void tuneP2PBenchmark(unsigned numParticles    = 5000000,
         if (!r.valid)
         {
             printf("  %2d | %5u | %3u %4u %4u %3u %4u | %3u %4u %4u %3u | %4s |"
-                   " %-40s | --        | --\n",
+                   " %-40s | --        | --                      | --\n",
                    r.numWarps, r.params.stackCap,
                    r.params.chunkSize, r.params.forcePush, r.params.attemptPush,
                    r.params.attemptPop, r.params.forcePop,
@@ -628,7 +640,7 @@ void tuneP2PBenchmark(unsigned numParticles    = 5000000,
 
         float speedup = singleStats.median / r.stats.median;
         printf("  %2d | %5u | %3u %4u %4u %3u %4u | %3u %4u %4u %3u | %4d |"
-               " %7.3f %7.3f %7.3f %7.3f %7.3f | %-9u | %5.2fx%s\n",
+               " %7.3f %7.3f %7.3f %7.3f %7.3f | %-9u | %6u/%-6u %6u/%-6u | %5.2fx%s\n",
                r.numWarps, r.params.stackCap,
                r.params.chunkSize, r.params.forcePush, r.params.attemptPush,
                r.params.attemptPop, r.params.forcePop,
@@ -637,7 +649,9 @@ void tuneP2PBenchmark(unsigned numParticles    = 5000000,
                r.totalBlocks,
                r.stats.median, r.stats.mean, r.stats.stddev,
                r.stats.minVal, r.stats.maxVal,
-               r.p2pCount, speedup, note);
+               r.p2pCount,
+               r.iactWHead, r.iactRHead, r.travWHead, r.travRHead,
+               speedup, note);
 
         if (r.stats.median < bestMedian)
         {
@@ -647,7 +661,7 @@ void tuneP2PBenchmark(unsigned numParticles    = 5000000,
     }
 
     printf("  ---+-------+-------------------------+---------------------+------+"
-           "------------------------------------------+-----------+---------\n");
+           "------------------------------------------+-----------+-------------------------+---------\n");
 
     if (bestIdx >= 0)
     {

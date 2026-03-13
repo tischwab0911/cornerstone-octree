@@ -239,10 +239,11 @@ void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize =
     int*           d_gIsP2P;  cudaMalloc(&d_gIsP2P, gCapacity * sizeof(int));
     unsigned*      d_writeHead;  cudaMalloc(&d_writeHead, sizeof(unsigned));
     unsigned*      d_readHead;   cudaMalloc(&d_readHead, sizeof(unsigned));
+    unsigned*      d_segCount;   cudaMalloc(&d_segCount, gNumSegments * sizeof(unsigned));
     unsigned*      d_segReady;   cudaMalloc(&d_segReady, gNumSegments * sizeof(unsigned));
     unsigned*      d_numProducers; cudaMalloc(&d_numProducers, sizeof(unsigned));
 
-    GlobalWorkQueue gq{d_gNodeA, d_gNodeB, d_gIsP2P, d_writeHead, d_readHead, d_segReady, gNumSegments};
+    GlobalWorkQueue gq{d_gNodeA, d_gNodeB, d_gIsP2P, d_writeHead, d_readHead, d_segCount, d_segReady, gNumSegments};
 
     // Global traversal work buffer
     constexpr unsigned tChunkSize   = HaloTravConfig::travChunkSize;
@@ -280,6 +281,7 @@ void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize =
         cudaMemset(d_dualFlags, 0, numTreeNodes * sizeof(uint8_t));
         cudaMemset(d_writeHead, 0, sizeof(unsigned));
         cudaMemset(d_readHead, 0, sizeof(unsigned));
+        cudaMemset(d_segCount, 0, gNumSegments * sizeof(unsigned));
         cudaMemset(d_segReady, 0, gNumSegments * sizeof(unsigned));
         cudaMemset(d_tWriteHead, 0, sizeof(unsigned));
         cudaMemset(d_tReadHead, 0, sizeof(unsigned));
@@ -389,6 +391,7 @@ void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize =
     cudaFree(d_gIsP2P);
     cudaFree(d_writeHead);
     cudaFree(d_readHead);
+    cudaFree(d_segCount);
     cudaFree(d_segReady);
     cudaFree(d_numProducers);
     cudaFree(d_tNodeA);

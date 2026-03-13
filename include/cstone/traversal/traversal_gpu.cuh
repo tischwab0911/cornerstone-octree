@@ -153,10 +153,12 @@ __device__ __forceinline__ void releaseFlag(unsigned* flag)
 
 
 template<unsigned cap>
-__device__ __forceinline__ bool ibStackPush(
+__device__ __forceinline__ bool ibQueuePush(
     TreeNodeIndex* __restrict__ ibA,
     TreeNodeIndex* __restrict__ ibB,
     int*           __restrict__ ibIsP2P,
+    unsigned*      __restrict__ ibHead,
+    unsigned*      __restrict__ ibTail,
     unsigned*      __restrict__ ibCount,
     unsigned*      __restrict__ ibFlag,
     const TreeNodeIndex* __restrict__ srcA,
@@ -172,44 +174,64 @@ __device__ __forceinline__ bool ibStackPush(
     success = tile.shfl(success, 0);
     if (!success) return false;
 
-    unsigned base;
-    if (lane == 0) base = *ibCount;
-    base = tile.shfl(base, 0);
+    unsigned count = 0u, tail = 0u;
+    if (lane == 0)
+    {
+        count = *ibCount;
+        tail  = *ibTail;
+    }
+    count = tile.shfl(count, 0);
+    tail  = tile.shfl(tail, 0);
 
-    if (base + numItems > cap)
+    if (count + numItems > cap)
     {
         if (lane == 0) releaseFlag(ibFlag);
         return false;
     }
 
-    for (unsigned i = lane; i < numItems; i += GpuConfig::warpSize)
+    unsigned first = min(numItems, cap - tail);
+    for (unsigned i = lane; i < first; i += GpuConfig::warpSize)
     {
-        // if (base + i >= cap) assert(false);
-        ibA[base + i]     = srcA[i];
-        ibB[base + i]     = srcB[i];
-        ibIsP2P[base + i] = srcIsP2P[i];
+        unsigned dst = tail + i;
+        ibA[dst]     = srcA[i];
+        ibB[dst]     = srcB[i];
+        ibIsP2P[dst] = srcIsP2P[i];
+    }
+
+    unsigned second = numItems - first;
+    for (unsigned i = lane; i < second; i += GpuConfig::warpSize)
+    {
+        ibA[i]     = srcA[first + i];
+        ibB[i]     = srcB[first + i];
+        ibIsP2P[i] = srcIsP2P[first + i];
     }
     __syncwarp();
 
     if (lane == 0)
     {
-        *ibCount = base + numItems;
+        unsigned newTail = tail + numItems;
+        if (newTail >= cap) newTail -= cap;
+        *ibTail  = newTail;
+        *ibCount = count + numItems;
         releaseFlag(ibFlag);
     }
     return true;
 }
 
-/*! @brief Try to pop up to warpSize items from the interaction buffer under flag protection.
- *  @param ibA, ibB, ibIsP2P  Shared-memory IB arrays
- *  @param ibCount            Shared-memory item count
- *  @param ibFlag             Shared-memory lock flag
- *  @param outA, outB, outIsP2P  Per-lane output (valid when lane < returned popCount)
- *  @param[out] popCount      Number of items actually popped
- *  @return true if the flag was acquired and pop attempted (popCount may be 0 if IB was empty) */
-__device__ __forceinline__ bool ibStackPop(
+/*! @brief Try to dequeue up to warpSize items from the shared-memory interaction queue.
+ *  @param ibA, ibB, ibIsP2P Shared-memory queue payload arrays
+ *  @param ibHead, ibTail, ibCount Queue state
+ *  @param ibFlag Shared-memory lock flag
+ *  @param outA, outB, outIsP2P Per-lane output (valid when lane < returned popCount)
+ *  @param[out] popCount Number of items actually dequeued
+ *  @return true if lock was acquired and dequeue attempted */
+template<unsigned cap>
+__device__ __forceinline__ bool ibQueuePop(
     TreeNodeIndex* __restrict__ ibA,
     TreeNodeIndex* __restrict__ ibB,
     int*           __restrict__ ibIsP2P,
+    unsigned*      __restrict__ ibHead,
+    unsigned*      __restrict__ ibTail,
     unsigned*      __restrict__ ibCount,
     unsigned*      __restrict__ ibFlag,
     TreeNodeIndex& outA,
@@ -220,22 +242,35 @@ __device__ __forceinline__ bool ibStackPop(
     auto tile = cg::coalesced_threads();
     unsigned lane = tile.thread_rank();
 
+    (void)ibTail;
     popCount = 0;
 
     int success;
     if (lane == 0) success = acquireFlag(ibFlag);
     success = tile.shfl(success, 0);
-
     if (!success) return false;
 
-    unsigned count;
-    if (lane == 0) count = *ibCount;
-    count = tile.shfl(count, 0u);
+    unsigned count = 0u, head = 0u;
+    if (lane == 0)
+    {
+        count = *ibCount;
+        head  = *ibHead;
+    }
+    count = tile.shfl(count, 0);
+    head  = tile.shfl(head, 0);
 
     unsigned take = min((unsigned)GpuConfig::warpSize, count);
-    if (lane < take)
+    unsigned first = min(take, cap - head);
+    if (lane < first)
     {
-        unsigned idx = count - 1 - lane;
+        unsigned idx = head + lane;
+        outA     = ibA[idx];
+        outB     = ibB[idx];
+        outIsP2P = ibIsP2P[idx];
+    }
+    else if (lane < take)
+    {
+        unsigned idx = lane - first;
         outA     = ibA[idx];
         outB     = ibB[idx];
         outIsP2P = ibIsP2P[idx];
@@ -243,7 +278,11 @@ __device__ __forceinline__ bool ibStackPop(
 
     if (lane == 0)
     {
+        unsigned newHead = head + take;
+        if (newHead >= cap) newHead -= cap;
+        *ibHead  = newHead;
         *ibCount = count - take;
+        __threadfence_block();
         releaseFlag(ibFlag);
     }
 
@@ -259,15 +298,15 @@ __device__ __forceinline__ bool ibStackPop(
  *  when fine-tuning.
  */
 template<unsigned StackCap_,
-         unsigned ChunkSize_       = StackCap_ / 8,
-         unsigned ForcePush_       = StackCap_ * 5 / 8,
-         unsigned AttemptPush_     = StackCap_ * 5 / 16,
-         unsigned AttemptPop_      = StackCap_ * 3 / 16,
-         unsigned ForcePop_        = StackCap_ * 1 / 16,
-         unsigned TravChunkSize_   = StackCap_ / 4,
+         unsigned ChunkSize_       = 128,
+         unsigned ForcePush_       = 640,
+         unsigned AttemptPush_     = 512,
+         unsigned AttemptPop_      = 160,
+         unsigned ForcePop_        = 64,
+         unsigned TravChunkSize_   = 256,
          unsigned TravForcePush_   = StackCap_ - 8 * GpuConfig::warpSize,
-         unsigned TravAttemptPush_ = StackCap_ * 1 / 4,
-         unsigned TravAttemptPop_  = StackCap_ * 1 / 16>
+         unsigned TravAttemptPush_ = 256,
+         unsigned TravAttemptPop_  = 32>
 struct TraversalConfig
 {
     //! @brief Shared-memory buffer capacity (node-pair slots)
@@ -299,6 +338,7 @@ struct GlobalWorkQueue
     int*           isP2P;       //!< [capacity] 1=p2p, 0=m2l (int for alignment)
     unsigned*      writeHead;   //!< atomic monotonic segment write counter
     unsigned*      readHead;    //!< atomic monotonic segment read counter
+    unsigned*      segCount;    //!< [numSegments] valid item count per segment
     unsigned*      segReady;    //!< [numSegments] per-segment ready flags
     unsigned       numSegments; //!< capacity / chunkSize
 };
@@ -400,9 +440,10 @@ bool assignPairBySplitting_regress(const TreeNodeIndex* __restrict__ childOffset
 }
 
 
-/*! @brief Try to push chunkSize items from local interaction buffer to global queue.
+/*! @brief Try to push up to chunkSize items from a local interaction buffer to the global queue.
  *  @return true if push succeeded
- *  Acquires ibFlag to safely read and shrink the IB. */
+ *  Vyukov-style MPMC: claim a unique slot via CAS on writeHead, then use 0/1 per-segment flag.
+ *  Uses per-segment counts to avoid sentinel padding and scan-on-pop. */
 template<class TravConfig>
 __device__ __forceinline__ bool tryPushToGlobal(
     GlobalWorkQueue gq,
@@ -413,14 +454,16 @@ __device__ __forceinline__ bool tryPushToGlobal(
     bool                        force)
 {
     constexpr unsigned chunk = TravConfig::chunkSize;
-    // constexpr unsigned cap   = TravConfig::stackCap;
-    
+
     auto tile = cg::coalesced_threads();
     const unsigned lane = tile.thread_rank();
-    
-    unsigned wHead = 0, rHead = 0, old = 7u, seg = 0;
 
+    // Phase 1: claim a unique write slot via CAS on writeHead
+    unsigned wHead = 0;
+    unsigned rHead = 0;
+    bool claimed = false;
     do {
+        
         if (lane == 0)
         {
             wHead = *gq.writeHead;
@@ -431,45 +474,51 @@ __device__ __forceinline__ bool tryPushToGlobal(
 
         if (wHead - rHead >= gq.numSegments) return false; // full
 
-        seg = wHead % gq.numSegments;
         if (lane == 0) {
-            old = atomicCAS(&gq.segReady[seg], 0u, 1u);
-            if (old == 0u) atomicAdd(gq.writeHead, 1u);
+            claimed = (atomicCAS(gq.writeHead, wHead, wHead + 1) == wHead);
         }
-        old = tile.shfl(old, 0);
-    } while (force && old != 0u);
+        claimed = tile.shfl(claimed, 0);
+    } while (force && !claimed);
 
-    if (old != 0u) return false; // contention
+    if (!claimed) return false;
 
-    // printf("Pushing to global: wHead=%u rHead=%u seg=%u\n", wHead, rHead, seg);
+    // Phase 2: wait for our segment to become free (bounded: only one specific pop can hold it)
+    unsigned seg = wHead % gq.numSegments;
+    if (lane == 0) {
+        while (atomicAdd(&gq.segReady[seg], 0u) != 0u) {}
+    }
+    tile.sync();
 
-    unsigned base     = seg * chunk;
-    unsigned count    = *bufCount;
+    // Phase 3: write data
+    unsigned base      = seg * chunk;
+
+    unsigned count;
+    if (lane == 0) count = atomicAdd(bufCount, 0u);
+    count = tile.shfl(count, 0);
+
     unsigned numPushed = min(chunk, count);
-    unsigned srcStart  = count - numPushed; // push from the end so remainder stays at front
+    unsigned srcStart  = count - numPushed;
 
-    for (unsigned i = lane; i < chunk; i += tile.num_threads()) {
-        if (i < numPushed) {
+    for (unsigned i = lane; i < numPushed; i += tile.num_threads()) {
             gq.nodeA[base + i] = bufA[srcStart + i];
             gq.nodeB[base + i] = bufB[srcStart + i];
             gq.isP2P[base + i] = bufIsP2P[srcStart + i];
-        } else {
-            gq.nodeA[base + i] = 0;
-            gq.nodeB[base + i] = 0;
-            gq.isP2P[base + i] = 2;
-        }
     }
-    __threadfence(); // ensure data visible to other blocks before signaling ready
+
+    // Phase 4: publish data and update count
+    __threadfence();
     if (lane == 0) {
-        atomicExch(&gq.segReady[seg], 2u);
         atomicSub(bufCount, numPushed);
+        gq.segCount[seg] = numPushed;
+        __threadfence_block();
+        atomicExch(&gq.segReady[seg], 1u);
     }
-    __threadfence_block();
     return true;
 }
 
 /*! @brief Try to pop chunkSize items from global queue into local interaction buffer.
  *  @return true if pop succeeded
+ *  Vyukov-style MPMC: claim a unique slot via CAS on readHead, then use 0/1 per-segment flag.
  *  Acquires ibFlag to safely grow the IB. */
 template<class TravConfig>
 __device__ __forceinline__ bool tryPopFromGlobal(
@@ -477,66 +526,87 @@ __device__ __forceinline__ bool tryPopFromGlobal(
     TreeNodeIndex* __restrict__ bufA,
     TreeNodeIndex* __restrict__ bufB,
     int*           __restrict__ bufIsP2P,
+    unsigned*      __restrict__ bufHead,
+    unsigned*      __restrict__ bufTail,
     unsigned*      __restrict__ bufCount,
     bool                        force,
     unsigned*      __restrict__ ibFlag)
 {
     constexpr unsigned chunk = TravConfig::chunkSize;
-    // constexpr unsigned cap   = TravConfig::stackCap;
 
     auto tile = cg::coalesced_threads();
     const unsigned lane = tile.thread_rank();
 
-    unsigned wHead = 0, rHead = 0, old = 7u, seg = 0;
+    // Phase 1: claim a unique read slot via CAS on readHead
+    // unsigned pos;
+    unsigned rHead = 0;
+    unsigned wHead = 0;
+    bool claimed = false;
     do {
+        // unsigned rHead = 0, wHead = 0;
         if (lane == 0)
         {
-            wHead = *gq.writeHead;
             rHead = *gq.readHead;
+            wHead = *gq.writeHead;
         }
-        wHead = tile.shfl(wHead, 0);
         rHead = tile.shfl(rHead, 0);
+        wHead = tile.shfl(wHead, 0);
 
         if (wHead <= rHead) return false; // empty
 
-        seg = rHead % gq.numSegments;
         if (lane == 0) {
-            old = atomicCAS(&gq.segReady[seg], 2u, 3u);
-            if (old == 2u) atomicAdd(gq.readHead, 1u);
+            claimed = (atomicCAS(gq.readHead, rHead, rHead + 1) == rHead);
         }
-        old = tile.shfl(old, 0);
-    } while (force && old != 2u);
+        claimed = tile.shfl(claimed, 0);
+        // pos = rHead;
+    } while (force && !claimed);
 
-    if (old != 2u) return false; // contention (should only happen if we dont force)
+    if (!claimed) return false;
+
+    // Phase 2: wait for our segment's data to be published (bounded: one specific push)
+    unsigned seg = rHead % gq.numSegments;
+    if (lane == 0) {
+        while (atomicAdd(&gq.segReady[seg], 0u) != 1u) {}
+    }
+    tile.sync();
+    __threadfence();
 
     unsigned base = seg * chunk;
 
-    // acquire flag from local buffer
+    // Exact payload length for this segment, published by producer.
+    unsigned validCount = 0;
+    if (lane == 0) validCount = gq.segCount[seg];
+    validCount = tile.shfl(validCount, 0);
+
+    // Acquire ibFlag to safely write into the local interaction buffer
     bool success = false;
-    // unsigned iter = 0;
     while (!success) {
         if (lane == 0) success = acquireFlag(ibFlag);
         success = tile.shfl(success, 0);
-        // if (lane == 0 && !success && (++iter % 256) == 0) printf("culprit!\n");
     }
 
-    unsigned localCount = *bufCount;
-    unsigned myValidCount = 0;
-    for (unsigned j = lane; j < chunk; j += tile.num_threads())
+    // Phase 3: enqueue valid items into the local ring queue tail.
+    unsigned tail = *bufTail;
+    unsigned count = *bufCount;
+    for (unsigned j = lane; j < validCount; j += tile.num_threads())
     {
-        if (gq.isP2P[base + j] != 2)
-        {
-            bufA[localCount + j]     = gq.nodeA[base + j];
-            bufB[localCount + j]     = gq.nodeB[base + j];
-            bufIsP2P[localCount + j] = gq.isP2P[base + j];
-            myValidCount++;
-        }
+        unsigned writeIdx = tail + j;
+        if (writeIdx >= TravConfig::stackCap) writeIdx -= TravConfig::stackCap;
+        bufA[writeIdx]     = gq.nodeA[base + j];
+        bufB[writeIdx]     = gq.nodeB[base + j];
+        bufIsP2P[writeIdx] = gq.isP2P[base + j];
     }
-    unsigned validCount = cg::reduce(tile, myValidCount, cg::plus<unsigned>());
 
+    // Phase 4: release ibFlag and free the segment
+    __threadfence_block();
     if (lane == 0) {
-        atomicAdd(bufCount, validCount);
+        unsigned newTail = tail + validCount;
+        if (newTail >= TravConfig::stackCap) newTail -= TravConfig::stackCap;
+        *bufTail  = newTail;
+        *bufCount = count + validCount;
+        (void)bufHead;
         releaseFlag(ibFlag);
+        gq.segCount[seg] = 0u;
         atomicExch(&gq.segReady[seg], 0u);
     }
     return true;
@@ -544,6 +614,7 @@ __device__ __forceinline__ bool tryPopFromGlobal(
 
 /*! @brief Try to push travChunkSize items from local traversal stack to global traversal queue.
  *  @return true if push succeeded
+ *  Vyukov-style MPMC: claim a unique slot via CAS on writeHead, then use 0/1 per-segment flag.
  *  Executed by lane 0 of producer warp only. */
 template<class TravConfig>
 __device__ __forceinline__ bool tryPushTraversalToGlobal(
@@ -554,13 +625,14 @@ __device__ __forceinline__ bool tryPushTraversalToGlobal(
     bool                        force)
 {
     constexpr unsigned chunk = TravConfig::travChunkSize;
-    // constexpr unsigned cap   = TravConfig::stackCap;
 
     auto tile = cg::coalesced_threads();
     const unsigned lane = tile.thread_rank();
 
-
-    unsigned wHead = 0, rHead = 0, old = 7u, seg = 0;
+    // Phase 1: claim a unique write slot via CAS on writeHead
+    bool claimed = false;
+    unsigned rHead = 0;
+    unsigned wHead = 0;
     do {
         if (lane == 0) {
             wHead = *gq.writeHead;
@@ -571,38 +643,45 @@ __device__ __forceinline__ bool tryPushTraversalToGlobal(
 
         if (wHead - rHead >= gq.numSegments) return false; // full
 
-        seg = wHead % gq.numSegments;
         if (lane == 0) {
-            old = atomicCAS(&gq.segReady[seg], 0u, 1u);
-            if (old == 0u) atomicAdd(gq.writeHead, 1u);
+            claimed = (atomicCAS(gq.writeHead, wHead, wHead + 1) == wHead);
         }
-        old = tile.shfl(old, 0);
-    } while (force && old != 0u);
+        claimed = tile.shfl(claimed, 0);
+    } while (force && !claimed);
 
-    if (old != 0u) return false; // contention
+    if (!claimed) return false;
 
+    // Phase 2: wait for our segment to become free (bounded: only one specific pop can hold it)
+    unsigned seg = wHead % gq.numSegments;
+    if (lane == 0) {
+        while (atomicAdd(&gq.segReady[seg], 0u) != 0u) {}
+    }
+    tile.sync();
+
+    // Phase 3: write data
     unsigned base  = seg * chunk;
     unsigned count = *bufCount;
-
-    // assert(count >= chunk && "tryPushTraversalToGlobal: bufCount < travChunkSize");
     for (unsigned i = lane; i < chunk && i < count; i += tile.num_threads())
     {
         unsigned srcIdx = count - chunk + i;
-        // assert(srcIdx < cap && "tryPushTraversalToGlobal: source index OOB");
+        // assert(srcIdx < TravConfig::stackCap && "tryPushTraversalToGlobal: srcIdx OOB");
         gq.nodeA[base + i] = bufA[srcIdx];
         gq.nodeB[base + i] = bufB[srcIdx];
     }
-    __threadfence(); // ensure data visible to other blocks before signaling ready
+
+    // Phase 4: publish data and update count
+    __threadfence();
     if (lane == 0) {
         atomicSub(bufCount, chunk);
-        __threadfence();
-        atomicExch(&gq.segReady[seg], 2u);
+        __threadfence_block();
+        atomicExch(&gq.segReady[seg], 1u);
     }
     return true;
 }
 
 /*! @brief Try to pop travChunkSize items from global traversal queue into local stack.
  *  @return true if pop succeeded
+ *  Vyukov-style MPMC: claim a unique slot via CAS on readHead, then use 0/1 per-segment flag.
  *  Executed by lane 0 of producer warp only. */
 template<class TravConfig>
 __device__ __forceinline__ bool tryPopTraversalFromGlobal(
@@ -613,45 +692,54 @@ __device__ __forceinline__ bool tryPopTraversalFromGlobal(
     bool                        force)
 {
     constexpr unsigned chunk = TravConfig::travChunkSize;
-    // constexpr unsigned cap   = TravConfig::stackCap;
-
 
     auto tile = cg::coalesced_threads();
     const unsigned lane = tile.thread_rank();
 
-    unsigned wHead = 0, rHead = 0, old = 7u, seg = 0;
-    do{
+    // Phase 1: claim a unique read slot via CAS on readHead
+    unsigned rHead = 0;
+    unsigned wHead = 0;
+    bool claimed = false;
+    do {
         if (lane == 0) {
-            wHead = *gq.writeHead;
             rHead = *gq.readHead;
+            wHead = *gq.writeHead;
         }
-        wHead = tile.shfl(wHead, 0);
         rHead = tile.shfl(rHead, 0);
+        wHead = tile.shfl(wHead, 0);
 
         if (wHead <= rHead) return false; // empty
 
-        seg = rHead % gq.numSegments;
         if (lane == 0) {
-            old = atomicCAS(&gq.segReady[seg], 2u, 3u);
-            if (old == 2u) atomicAdd(gq.readHead, 1u);
+            claimed = (atomicCAS(gq.readHead, rHead, rHead + 1) == rHead);
         }
-        old = tile.shfl(old, 0);
-    } while (force && old != 2u);
+        claimed = tile.shfl(claimed, 0);
+    } while (force && !claimed);
 
-    if (old != 2u) return false; // contention or not ready
+    if (!claimed) return false;
 
+    // Phase 2: wait for our segment's data to be published (bounded: one specific push)
+    unsigned seg = rHead % gq.numSegments;
+    if (lane == 0) {
+        while (atomicAdd(&gq.segReady[seg], 0u) != 1u) {}
+    }
+    tile.sync();
+    __threadfence();
+
+    // Phase 3: read data
     unsigned base = seg * chunk;
     unsigned count = *bufCount;
-    // assert(count + chunk <= cap && "tryPopTraversalFromGlobal: stack overflow");
     for (unsigned i = lane; i < chunk; i += tile.num_threads())
     {
+        // assert(count + i < TravConfig::stackCap && "tryPopTraversalFromGlobal: write OOB");
         bufA[count + i] = gq.nodeA[base + i];
         bufB[count + i] = gq.nodeB[base + i];
     }
-    __threadfence_block(); // ensure shared-mem writes visible before publishing count
-    if(lane == 0) {
+
+    // Phase 4: update count and free the segment
+    if (lane == 0) {
         atomicAdd(bufCount, chunk);
-        __threadfence();
+        __threadfence_block();
         atomicExch(&gq.segReady[seg], 0u);
     }
     return true;
@@ -676,13 +764,24 @@ __device__ void dualTraversalBlock(
     __shared__ TreeNodeIndex interactionBufferA[stackCap];
     __shared__ TreeNodeIndex interactionBufferB[stackCap];
     __shared__ int interactionBufferIsP2P[stackCap];
+    __shared__ unsigned interactionBufferHead;
+    __shared__ unsigned interactionBufferTail;
     __shared__ unsigned interactionBufferCount;
     __shared__ unsigned ibFlag; // 0=free, 1=held
 
+
+    __shared__ TreeNodeIndex localStackA[stackCap];
+    __shared__ TreeNodeIndex localStackB[stackCap];
+    __shared__ unsigned localStackTop;
+
     __shared__ unsigned globalPopFlag;
+    auto pRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*numActiveProducers);
+    
 
     if (tid == 0)
     {
+        interactionBufferHead = 0;
+        interactionBufferTail = 0;
         interactionBufferCount = 0;
         ibFlag = 0;
         globalPopFlag = 0;
@@ -690,11 +789,12 @@ __device__ void dualTraversalBlock(
     block.sync();
 
     producer = producer && (tid < GpuConfig::warpSize);
+    bool trivial = !producer;
 
     // ── Handle trivial cases before entering producer loop ──
     if (producer)
     {
-        bool trivial = false;
+        // bool trivial = false;
         if (isLeaf(childOffsets, a) && isLeaf(childOffsets, b))
         {
             // Both leaves: p2p if criterion passes, otherwise skip.
@@ -713,7 +813,7 @@ __device__ void dualTraversalBlock(
 
         if (trivial)
         {
-            producer = false;
+            // producer = false;
             __threadfence();
             if (tid == 0)
             {
@@ -723,12 +823,11 @@ __device__ void dualTraversalBlock(
         }
     }
 
+    producer = tid < GpuConfig::warpSize;
+
     // ── Producer loop (warp 0 only, skip if trivial) ──
     if (producer)
     {
-        __shared__ TreeNodeIndex localStackA[stackCap];
-        __shared__ TreeNodeIndex localStackB[stackCap];
-        __shared__ unsigned localStackTop;
 
         // Temporary interaction buffer — one outer-loop iteration produces
         // at most warpSize × 8 = 256 interaction items.  Writing into a
@@ -740,11 +839,26 @@ __device__ void dualTraversalBlock(
         __shared__ int           tmpIBP2P[tmpCap];
         __shared__ unsigned      tmpIBCount;
 
-        if (tid == 0)
+        // Flattened expansion: parent data for warp-parallel child processing
+        __shared__ TreeNodeIndex smem_parentACO[GpuConfig::warpSize];
+        __shared__ TreeNodeIndex smem_parentBCO[GpuConfig::warpSize];
+        __shared__ TreeNodeIndex smem_parentA[GpuConfig::warpSize];
+        __shared__ TreeNodeIndex smem_parentB[GpuConfig::warpSize];
+        __shared__ unsigned      smem_parentSplitA[GpuConfig::warpSize];
+
+        auto wRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*globalTraversalQueue.writeHead);
+        auto rRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*globalTraversalQueue.readHead);
+
+        bool currentlySignaledAsActive = !trivial;
+
+        if (tid == 0 && currentlySignaledAsActive)
         {
             localStackA[0] = a;
             localStackB[0] = b;
             localStackTop = 1;
+            tmpIBCount = 0;
+        } else if (tid == 0){
+            localStackTop = 0;
             tmpIBCount = 0;
         }
         __syncwarp();
@@ -757,14 +871,15 @@ __device__ void dualTraversalBlock(
             // ── Pop items from traversal stack, capped by available headroom ──
             // Each popped item generates up to 8 children, so we need
             // 8 * popCount free slots on the stack after the pop.
-            
-            unsigned room = (stackCap > localStackTop) ? (stackCap - localStackTop) : 0;
-            unsigned maxPop = room / 8;
-            if (maxPop == 0 && localStackTop > 0) maxPop = 1; // guarantee progress
-            unsigned popCount = min(min(localStackTop, (unsigned)GpuConfig::warpSize), maxPop);
+            unsigned curStackTop_;
+            if (tid == 0) curStackTop_ = atomicAdd(&localStackTop, 0u);
+            curStackTop_ = __shfl_sync(0xFFFFFFFFu, curStackTop_, 0);
+            unsigned room = (stackCap > curStackTop_) ? (stackCap - curStackTop_) : 0;
+            unsigned maxPop = room / 7;
+            unsigned popCount = min(min(curStackTop_, (unsigned)GpuConfig::warpSize), maxPop);
             if (tid < popCount)
             {
-                unsigned readIdx = localStackTop - 1 - tid;
+                unsigned readIdx = curStackTop_ - 1 - tid;
                 // assert(readIdx < stackCap && "Producer stack pop: readIdx OOB");
                 a = localStackA[readIdx];
                 b = localStackB[readIdx];
@@ -772,75 +887,125 @@ __device__ void dualTraversalBlock(
             if (tid == 0) localStackTop -= popCount;
             __syncwarp();
 
-            if (tid < popCount)
+            // ── Optimization 1: Flattened child expansion across the warp ──
+            // Instead of popCount threads each serially iterating 8 children,
+            // store parent data in smem and process ALL children in warp-parallel
+            // rounds of 32, reducing atomics from 16 to 2-4 per outer iteration.
             {
-                TreeNodeIndex aCO = childOffsets[a];
-                TreeNodeIndex bCO = childOffsets[b];
-                bool aIsLeaf = (aCO == 0);
-                bool bIsLeaf = (bCO == 0);
-                bool splitA = (a < b && !aIsLeaf) || bIsLeaf;
+                TreeNodeIndex aCO_ = 0, bCO_ = 0;
+                bool splitA_ = false;
+                bool hasChildren = false;
 
-                int newChildren = splitA ? 8 * (!aIsLeaf) : 8 * (!bIsLeaf);
-
-                // NOTE: do NOT use #pragma unroll here — localStackTop and
-                // interactionBufferCount are updated via atomicAdd at the end
-                // of each iteration, and subsequent iterations must see the
-                // fresh values.  Unrolling lets the compiler hoist/CSE the
-                // plain shared-memory loads across iterations, causing
-                // multiple iterations to compute the SAME write positions and
-                // silently overwrite each other's data.
-                for (int i = 0; i < newChildren; ++i)
+                if (tid < popCount)
                 {
-                    auto tile = cg::coalesced_threads();
-                    TreeNodeIndex childA = splitA ? aCO + i : a;
-                    TreeNodeIndex childB = splitA ? b : bCO + i;
-                    bool cont = continuation(childA, childB);
+                    aCO_ = childOffsets[a];
+                    bCO_ = childOffsets[b];
+                    bool aIsLeaf = (aCO_ == 0);
+                    bool bIsLeaf = (bCO_ == 0);
+                    splitA_ = (a < b && !aIsLeaf) || bIsLeaf;
+                    hasChildren = splitA_ ? !aIsLeaf : !bIsLeaf;
+                }
 
-                    bool childAIsLeaf = (childOffsets[childA] == 0);
-                    bool childBIsLeaf = (childOffsets[childB] == 0);
+                // Compact parents with children into contiguous smem slots
+                unsigned hasMask = __ballot_sync(0xFFFFFFFFu, hasChildren);
+                unsigned compIdx = __popc(hasMask & ((1u << tid) - 1));
+                unsigned numActiveParents = __popc(hasMask);
 
-                    int isTraversal = cont && !(childAIsLeaf && childBIsLeaf) ? 1 : 0;
-                    int pos = cg::exclusive_scan(tile, isTraversal);
-                    int total = pos + isTraversal;
-                    total = tile.shfl(total, tile.num_threads() - 1);
+                if (hasChildren)
+                {
+                    smem_parentACO[compIdx]    = aCO_;
+                    smem_parentBCO[compIdx]    = bCO_;
+                    smem_parentA[compIdx]      = a;
+                    smem_parentB[compIdx]      = b;
+                    smem_parentSplitA[compIdx] = splitA_ ? 1u : 0u;
+                }
+                __syncwarp();
 
-                    // Atomic reads to get fresh values from shared memory,
-                    // preventing the compiler from reusing stale registers
-                    // across loop iterations.
-                    unsigned curStackTop = atomicAdd(&localStackTop, 0u);
-                    unsigned curTmpCount = atomicAdd(&tmpIBCount, 0u);
+                unsigned totalChildren = numActiveParents * 8;
+                unsigned numRounds = (totalChildren + GpuConfig::warpSize - 1)
+                                   / GpuConfig::warpSize;
+
+                for (unsigned round = 0; round < numRounds; ++round)
+                {
+                    unsigned flatIdx = round * GpuConfig::warpSize + tid;
+                    bool active = flatIdx < totalChildren;
+
+                    TreeNodeIndex childA = 0, childB = 0;
+                    bool cont = false;
+                    int isTraversal = 0;
+
+                    if (active)
+                    {
+                        unsigned pIdx = flatIdx >> 3;   // / 8
+                        unsigned cOff = flatIdx & 7;    // % 8
+                        bool pSplitA = smem_parentSplitA[pIdx];
+                        childA = pSplitA ? smem_parentACO[pIdx] + (TreeNodeIndex)cOff
+                                         : smem_parentA[pIdx];
+                        childB = pSplitA ? smem_parentB[pIdx]
+                                         : smem_parentBCO[pIdx] + (TreeNodeIndex)cOff;
+                        cont = continuation(childA, childB);
+                        bool childAIsLeaf = (childOffsets[childA] == 0);
+                        bool childBIsLeaf = (childOffsets[childB] == 0);
+                        isTraversal = cont && !(childAIsLeaf && childBIsLeaf) ? 1 : 0;
+                    }
+
+                    bool isInteraction = active && !isTraversal;
+
+                    // Warp-wide ballot for parallel classification
+                    unsigned travMask = __ballot_sync(0xFFFFFFFFu, isTraversal);
+                    unsigned iactMask = __ballot_sync(0xFFFFFFFFu, isInteraction);
+
+                    unsigned travPos   = __popc(travMask & ((1u << tid) - 1));
+                    unsigned totalTrav = __popc(travMask);
+                    unsigned iactPos   = __popc(iactMask & ((1u << tid) - 1));
+                    unsigned totalIact = __popc(iactMask);
+
+                    unsigned curStackTop, curTmpCount;
+                    if (tid == 0)
+                    {
+                        curStackTop = atomicAdd(&localStackTop, totalTrav);
+                        curTmpCount = atomicAdd(&tmpIBCount, totalIact);
+                    }
+                    curStackTop = __shfl_sync(0xFFFFFFFFu, curStackTop, 0);
+                    curTmpCount = __shfl_sync(0xFFFFFFFFu, curTmpCount, 0);
 
                     if (isTraversal)
                     {
-                        unsigned writePos = pos + curStackTop;
-                        // assert(writePos < stackCap && "Producer stack push: writePos OOB");
-                        localStackA[writePos] = childA;
-                        localStackB[writePos] = childB;
+                        localStackA[curStackTop + travPos] = childA;
+                        localStackB[curStackTop + travPos] = childB;
                     }
-                    else
+                    else if (isInteraction)
                     {
-                        // interaction item -> temporary buffer (merged after inner loop)
-                        pos = tile.thread_rank() - pos;
-                        unsigned writeIdx = pos + curTmpCount;
-                        // if (lane == 0 && writeIdx >= tmpCap) printf("Write Index: %u, Temp Cap: %u\n",writeIdx,tmpCap);
-                        // assert(writeIdx < tmpCap && "Producer tmp IB: index OOB");
-                        tmpIBA[writeIdx]   = childA;
-                        tmpIBB[writeIdx]   = childB;
-                        tmpIBP2P[writeIdx] = cont ? 1 : 0;
+                        tmpIBA[curTmpCount + iactPos]   = childA;
+                        tmpIBB[curTmpCount + iactPos]   = childB;
+                        tmpIBP2P[curTmpCount + iactPos] = cont ? 1 : 0;
                     }
 
-                    if (tile.thread_rank() == tile.num_threads() - 1)
-                    {
-                        // unsigned newStackTop = curStackTop + (unsigned)total;
-                        unsigned newTmpCount = curTmpCount + (unsigned)(tile.num_threads() - total);
-                        // assert(newStackTop <= stackCap && "Producer: localStackTop would exceed stackCap");
-                        // assert(newTmpCount <= tmpCap && "Producer: tmpIBCount would exceed tmpCap");
-                        atomicAdd(&localStackTop, (unsigned)total);
-                        atomicAdd(&tmpIBCount, (unsigned)(tile.num_threads() - total));
-                    }
+                    // Optimization 2: opportunistic mid-expansion drain to IB.
+                    // Push tmpIB items into the main IB between rounds so
+                    // consumers get work sooner and the post-expansion drain
+                    // loop completes faster (or is skipped entirely).
+                    // if (round < numRounds - 1)
+                    // {
+                    //     unsigned curTmpIB;
+                    //     if (tid == 0) curTmpIB = atomicAdd(&tmpIBCount, 0u);
+                    //     curTmpIB = __shfl_sync(0xFFFFFFFFu, curTmpIB, 0);
+
+                    //     if (curTmpIB >= GpuConfig::warpSize)
+                    //     {
+                    //         if (ibStackPush<stackCap>(
+                    //                 interactionBufferA, interactionBufferB,
+                    //                 interactionBufferIsP2P,
+                    //                 &interactionBufferCount, &ibFlag,
+                    //                 tmpIBA, tmpIBB, tmpIBP2P, curTmpIB))
+                    //         {
+                    //             if (tid == 0) atomicExch(&tmpIBCount, 0u);
+                    //         }
+                    //     }
+                    // }
                 }
             }
-            __syncwarp(); // ensure all inner-loop writes to tmpIB/localStack are visible
+            __syncwarp(); // ensure all writes to tmpIB/localStack are visible
 
             // if (tid == 0 && (++__producerIterCount % 4096) == 0)
             //     printf("[PRODUCER blk=%u] main iter=%u lstk=%u tmpIB=%u ibCount=%u producers=%u\n",
@@ -849,54 +1014,46 @@ __device__ void dualTraversalBlock(
             //            atomicAdd(numActiveProducers, 0u));
 
             // unsigned __drainIter = 0;
-            while (tmpIBCount > 0) {
+            for (;;) {
+                unsigned ibCount, curTmpIB, lstop;
+                if (lane == 0) {
+                    curTmpIB = atomicAdd(&tmpIBCount, 0u);
+                    ibCount  = atomicAdd(&interactionBufferCount, 0u);
+                    lstop    = atomicAdd(&localStackTop, 0u);
+                }
+                curTmpIB = __shfl_sync(0xFFFFFFFFu, curTmpIB, 0);
+                ibCount  = __shfl_sync(0xFFFFFFFFu, ibCount, 0);
+                lstop    = __shfl_sync(0xFFFFFFFFu, lstop, 0);
+                if (curTmpIB == 0) break;
 
-                // auto tile = cg::coalesced_threads();
-                // if (tile.num_threads() != GpuConfig::warpSize) {
-                //     if (tile.thread_rank() == 0) assert(false);
-                // }
-
-                // Force reload from shared memory — interactionBufferCount is
-                // modified by consumer warps; without an atomic read the
-                // compiler may cache a stale value in a register, causing the
-                // producer to spin forever on the wrong branch.
-                unsigned ibCount;
-                if (lane == 0) ibCount = interactionBufferCount;
-                ibCount = __shfl_sync(0xFFFFFFFFu, ibCount, 0);
-
-                if (ibCount > TravConfig::forcePush || (ibCount + tmpIBCount > TravConfig::stackCap)) {
-                    // if (lane == 0) printf("Block attempting force push\n");
+                if (ibCount > TravConfig::forcePush || (ibCount + curTmpIB > TravConfig::stackCap)) {
                     if (tryPushToGlobal<TravConfig>(globalQueue, tmpIBA, tmpIBB, tmpIBP2P, &tmpIBCount, true)) {}
-                    else if (localStackTop > TravConfig::travAttemptPush) {
+                    else if (lstop > TravConfig::travAttemptPush) {
                         tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, false);
                     }
                 } else if (ibCount > TravConfig::attemptPush) {
-                    // if (lane == 0) printf("Block attempting push\n");
                     if (tryPushToGlobal<TravConfig>(globalQueue, tmpIBA, tmpIBB, tmpIBP2P, &tmpIBCount, false)) {}
                     else {
-                        if (ibStackPush<TravConfig::stackCap>(interactionBufferA, interactionBufferB, interactionBufferIsP2P,
+                        if (ibQueuePush<TravConfig::stackCap>(interactionBufferA, interactionBufferB, interactionBufferIsP2P,
+                                                              &interactionBufferHead, &interactionBufferTail,
                                                               &interactionBufferCount, &ibFlag,
-                                                              tmpIBA, tmpIBB, tmpIBP2P, tmpIBCount)) {
+                                                              tmpIBA, tmpIBB, tmpIBP2P, curTmpIB)) {
                             if (lane == 0) atomicExch(&tmpIBCount, 0u);
                         }
                     }
-                    // if (lane == 0) printf("Block attempted push\n");
                 } else {
-                    // if (lane == 0) printf("Block attempting push to local Stack \n");
-                    if (ibStackPush<TravConfig::stackCap>(interactionBufferA, interactionBufferB, interactionBufferIsP2P,
+                    if (ibQueuePush<TravConfig::stackCap>(interactionBufferA, interactionBufferB, interactionBufferIsP2P,
+                                                          &interactionBufferHead, &interactionBufferTail,
                                                           &interactionBufferCount, &ibFlag,
-                                                          tmpIBA, tmpIBB, tmpIBP2P, tmpIBCount)) {
-                        // if (lane == 0) printf("Successful\n");
+                                                          tmpIBA, tmpIBB, tmpIBP2P, curTmpIB)) {
                         if (lane == 0) atomicExch(&tmpIBCount, 0u);
-                    } 
-                    else if (localStackTop > TravConfig::travForcePush) {
+                    }
+                    else if (lstop > TravConfig::travForcePush) {
                         tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, false);
                     }
-                    // if (lane == 0) printf("Block completed push to local Stack \n");
                 }
-                // __threadfence_block();
               
-
+                // -------------------------- DEBUGGING INFO --------------------------
                 // if (lane == 0 && (++__drainIter % 4096) == 0)
                 //     printf("[DRAIN blk=%u] iter=%u tmpIB=%u ibCount=%u lstk=%u gqW=%u gqR=%u producers=%u\n",
                 //            blockIdx.x, __drainIter,
@@ -908,67 +1065,125 @@ __device__ void dualTraversalBlock(
             __syncwarp();
 
             // traversal push and pop logic
-            if (localStackTop >= TravConfig::travForcePush || (localStackTop + GpuConfig::warpSize * 8 >= stackCap)) {
+            // int iter = 0;
+            // unsigned pre = 2;
+
+            bool terminate = false;
+            // unsigned wHead = 0, rHead = 0;
+
+            unsigned curLST;
+            if (tid == 0) curLST = atomicAdd(&localStackTop, 0u);
+            curLST = __shfl_sync(0xFFFFFFFFu, curLST, 0);
+            if (curLST >= TravConfig::travForcePush || (curLST + GpuConfig::warpSize * 8 >= stackCap)) {
                 tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, true);
-            } else if (localStackTop > TravConfig::travAttemptPush) {
+            } else if (curLST > TravConfig::travAttemptPush) {
                 tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, false);
-            } else if (localStackTop == 0) {
-                // if (lane == 0) printf("Enter\n");
-                if (tryPopTraversalFromGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, true)) {}
-                else {
-                    // if (lane == 0) printf("Exit\n");
-                    break;
-                }
-            } else if (localStackTop <= TravConfig::travAttemptPop) {
+            } else if (curLST == 0) {
+                // unsigned readLocal
+                // do {
+                    if (tryPopTraversalFromGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, true)) {
+                        if (tid == 0 && !currentlySignaledAsActive) {
+                            atomicAdd(numActiveProducers, 1u);
+                            __threadfence(); 
+                            // printf("[INCR blk=%u] pop from global, pre=%u\n", blockIdx.x, atomicAdd(numActiveProducers, 0u));
+                        }
+                        if (!currentlySignaledAsActive) currentlySignaledAsActive = true;
+                        // break;
+                    }
+                    else {
+                        if (tid == 0 && currentlySignaledAsActive) {
+                            atomicSub(numActiveProducers, 1u);
+                            __threadfence();
+                            // printf("[DECR blk=%u] failed pop from global, pre=%u\n", blockIdx.x, atomicAdd(numActiveProducers, 0u));
+                        }
+                        // pre = tile.shfl(pre, 0);
+                        if (currentlySignaledAsActive) currentlySignaledAsActive = false;
+                    }
+
+                    
+                // } while (localStackTop == 0 && !terminate);
+            } else if (curLST <= TravConfig::travAttemptPop) {
                 tryPopTraversalFromGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, false);
             }
+           
             __syncwarp();
+
+            if (tid == 0 && !currentlySignaledAsActive) {
+                unsigned localCount = atomicAdd(&localStackTop, 0u);  // force reload from smem
+                unsigned producers = pRef.load(cuda::memory_order_acquire);
+                unsigned wHead     = wRef.load(cuda::memory_order_acquire);
+                unsigned rHead     = rRef.load(cuda::memory_order_acquire);
+                terminate = (localCount == 0 && wHead <= rHead && producers == 0);
+                // printf("[TERMINATE CHECK blk=%u] producers=%u\n", blockIdx.x, atomicAdd(numActiveProducers, 0u));
+                if (currentlySignaledAsActive && terminate) {
+                    atomicSub(numActiveProducers, 1u);
+                    __threadfence();
+                }
+            }
+            terminate = __shfl_sync(0xFFFFFFFFu, terminate, 0);
+            // if (lane == 0) {
+            //     terminate = (pRef.load(cuda::memory_order_acquire) == 0);
+            //     printf("[TERMINATE CHECK blk=%u] producers=%u\n", blockIdx.x, atomicAdd(numActiveProducers, 0u));
+            // }
+            // terminate = __shfl_sync(0xFFFFFFFFu, terminate, 0);
+            if (terminate) break;
+            
         }
+        // -------------------------- DEBUG INFO --------------------------
         // if (tid == 0) printf("[PRODUCER blk=%u] exiting main loop\n", blockIdx.x);
         // __threadfence(); // ensure all IB/global-queue writes visible before signaling done
-        if(lane == 0)
-        {
-            unsigned pre = atomicSub(numActiveProducers, 1u);
-            // printf("[DECR blk=%u] END-OF-LOOP, pre=%u\n", blockIdx.x, pre);
-        }
+        // if(lane == 0)
+        // {
+        //     unsigned pre = atomicSub(numActiveProducers, 1u);
+        //     // printf("[DECR blk=%u] END-OF-LOOP, pre=%u\n", blockIdx.x, pre);
+        // }
     }
 
     // unsigned consumerSpinCount = 0;
     auto tile = cg::coalesced_threads();
-
+    // auto pRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*numActiveProducers);
     auto wRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*globalQueue.writeHead);
     auto rRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*globalQueue.readHead);
-    auto pRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*numActiveProducers);
+    const unsigned warpId = tid / GpuConfig::warpSize;
     for (;;)
     {
         // consumerSpinCount++;
         // if (lane == 0 && (consumerSpinCount & 0x3FFFF) == 0)
-        //     printf("[Consumer blk=%u warp=%u] spin %u: ibCount=%u ibFlag=%u wHead=%u rHead=%u producers=%u\n",
+        //     printf("[Consumer blk=%u warp=%u] spin %u: ibCount=%u ibFlag=%u gPopFlag=%u "
+        //            "iactW=%u iactR=%u travW=%u travR=%u producers=%u, localStackTop=%u\n",
         //            blockIdx.x, tid / GpuConfig::warpSize, consumerSpinCount,
         //            atomicAdd(&interactionBufferCount, 0u), atomicAdd(&ibFlag, 0u),
+        //            atomicAdd(&globalPopFlag, 0u),
         //            atomicAdd(globalQueue.writeHead, 0u),
         //            atomicAdd(globalQueue.readHead, 0u),
-        //            atomicAdd(numActiveProducers, 0u));
+        //            atomicAdd(globalTraversalQueue.writeHead, 0u),
+        //            atomicAdd(globalTraversalQueue.readHead, 0u),
+        //            atomicAdd(numActiveProducers, 0u),
+        //             atomicAdd(&localStackTop, 0u));
 
         // ── Try to pop items from local IB (flag-guarded) ──
-        TreeNodeIndex itemA, itemB;
-        int itemIsP2P;
-        unsigned popCount = 0;
+        TreeNodeIndex itemA = 0u, itemB = 0u;
+        int itemIsP2P = false;
+        unsigned popCount = 0u;
 
         unsigned numLocal;
         if (lane == 0) {
-            numLocal = interactionBufferCount;
+            numLocal = atomicAdd(&interactionBufferCount, 0u);
         }
         numLocal = tile.shfl(numLocal, 0);
 
-        if (numLocal < TravConfig::attemptPop) {
+        if (numLocal < TravConfig::attemptPop && warpId == 0) {
             bool success = false;
             if (lane == 0) success = acquireFlag(&globalPopFlag);
             success = tile.shfl(success, 0);
 
             if(success) {
                 bool force = numLocal <= TravConfig::forcePop;
-                tryPopFromGlobal<TravConfig>(globalQueue, interactionBufferA, interactionBufferB, interactionBufferIsP2P, &interactionBufferCount, force, &ibFlag);
+                tryPopFromGlobal<TravConfig>(globalQueue,
+                                             interactionBufferA, interactionBufferB, interactionBufferIsP2P,
+                                             &interactionBufferHead, &interactionBufferTail,
+                                             &interactionBufferCount,
+                                             force, &ibFlag);
                 if (lane == 0) releaseFlag(&globalPopFlag);
             }
         }
@@ -976,12 +1191,15 @@ __device__ void dualTraversalBlock(
         // __syncwarp();
 
         if (lane == 0) {
-            numLocal = interactionBufferCount;
+            numLocal = atomicAdd(&interactionBufferCount, 0u);
         }
         numLocal = tile.shfl(numLocal, 0);
 
         if (numLocal > 0) {
-            ibStackPop(interactionBufferA, interactionBufferB, interactionBufferIsP2P, &interactionBufferCount, &ibFlag, itemA, itemB, itemIsP2P, popCount);
+            ibQueuePop<TravConfig::stackCap>(interactionBufferA, interactionBufferB, interactionBufferIsP2P,
+                                             &interactionBufferHead, &interactionBufferTail,
+                                             &interactionBufferCount, &ibFlag,
+                                             itemA, itemB, itemIsP2P, popCount);
         }
 
         // __syncwarp();
@@ -991,20 +1209,22 @@ __device__ void dualTraversalBlock(
         {
             // if (!(itemIsP2P == 0 || itemIsP2P == 1)) {printf("Item: %d\n", itemIsP2P);}
             // assert((itemIsP2P == 0 || itemIsP2P == 1) && "Consumer: itemIsP2P corrupted");
+            // assert(itemA >= 0 && "Consumer: itemA is negative");
+            // assert(itemB >= 0 && "Consumer: itemB is negative");
             if (itemIsP2P)  p2p(itemA, itemB);
             else            m2l(itemA, itemB);
         }
         // __syncwarp();
 
-        unsigned localCount, wHead, rHead, producers;
+        // unsigned localCount, wHead, rHead, producers;
 
         bool terminate = false;
         if (popCount == 0) {
             if (lane == 0) {
-                localCount = interactionBufferCount;  // smem: plain load if synchronized
-                producers = pRef.load(cuda::memory_order_acquire);
-                wHead     = wRef.load(cuda::memory_order_acquire);
-                rHead     = rRef.load(cuda::memory_order_acquire);
+                unsigned localCount = atomicAdd(&interactionBufferCount, 0u);  // force reload from smem
+                unsigned producers = pRef.load(cuda::memory_order_acquire);
+                unsigned wHead     = wRef.load(cuda::memory_order_acquire);
+                unsigned rHead     = rRef.load(cuda::memory_order_acquire);
                 terminate = (localCount == 0 && wHead <= rHead && producers == 0);
             }
             terminate = tile.shfl(terminate, 0);
