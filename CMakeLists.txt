@@ -43,7 +43,7 @@ if(CSTONE_WITH_CUDA)
         # Thrust and CUB are part of CUDAToolkit
         set(CSTONE_THRUST_LIBS "")
         set(CMAKE_CUDA_STANDARD 20)
-	set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --extended-lambda")
+	set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --extended-lambda -lineinfo")
     else()
         message(STATUS "No CUDA support")
         set(CSTONE_WITH_CUDA OFF)
