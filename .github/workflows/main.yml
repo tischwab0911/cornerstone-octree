@@ -1,0 +1,29 @@
+name: Build Check
+
+on:
+  push:
+    branches: [ experimental ]
+  pull_request:
+    branches: [ experimental ]   # Claude's PRs target this branch
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.3.1-devel-ubuntu22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CMake & Ninja
+        run: apt-get update && apt-get install -y cmake ninja-build
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=90
+
+      - name: Build
+        run: cmake --build build --parallel
