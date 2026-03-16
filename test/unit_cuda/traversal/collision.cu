@@ -286,7 +286,8 @@ void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize =
         cudaMemset(d_tWriteHead, 0, sizeof(unsigned));
         cudaMemset(d_tReadHead, 0, sizeof(unsigned));
         cudaMemset(d_tSegReady, 0, tNumSegments * sizeof(unsigned));
-        cudaMemcpy(d_numProducers, &totalBlocks, sizeof(unsigned), cudaMemcpyHostToDevice);
+        unsigned producerWarpsTotal = totalBlocks * 2u;
+        cudaMemcpy(d_numProducers, &producerWarpsTotal, sizeof(unsigned), cudaMemcpyHostToDevice);
 
         cudaLaunchKernelEx(&dualCfg,
                            dualTraversalHalosKernel<DualHaloConfig::numWarps, KeyType, T>,

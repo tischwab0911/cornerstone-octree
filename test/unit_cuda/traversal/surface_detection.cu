@@ -183,7 +183,8 @@ void dualTraversalNeighborsGpu()
         dualTraversalNeighborsCount<TravConfig::numWarps, KeyType>,
         TravConfig::numThreadsPerBlock, TravConfig::kBlocksPerCluster);
     unsigned totalBlocks = std::min(TravConfig::kTotalBlocks, maxBlocks);
-    cudaMemcpy(d_nProd, &totalBlocks, sizeof(unsigned), cudaMemcpyHostToDevice);
+    unsigned producerWarpsTotal = totalBlocks * 2u;
+    cudaMemcpy(d_nProd, &producerWarpsTotal, sizeof(unsigned), cudaMemcpyHostToDevice);
     GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wHead, d_rHead, d_segCount, d_segR, gSegs};
 
     // Global traversal queue

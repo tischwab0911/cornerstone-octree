@@ -322,7 +322,8 @@ void dualVsSingleTraversalSurfaceGpu(unsigned numParticles = 2000000,
         cudaMemset(d_twHead, 0, sizeof(unsigned));
         cudaMemset(d_trHead, 0, sizeof(unsigned));
         cudaMemset(d_tsegR, 0, tSegs * sizeof(unsigned));
-        cudaMemcpy(d_nProd, &dualTotalBlocks, sizeof(unsigned), cudaMemcpyHostToDevice);
+        unsigned producerWarpsTotal = dualTotalBlocks * 2u;
+        cudaMemcpy(d_nProd, &producerWarpsTotal, sizeof(unsigned), cudaMemcpyHostToDevice);
         cudaLaunchKernelEx(&dualCfg,
                            dualTraversalSurfaceCount<DualTravConfig::numWarps, KeyType>,
                            rawPtr(d_childOffsets),

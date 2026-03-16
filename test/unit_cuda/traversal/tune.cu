@@ -28,11 +28,14 @@
  */
 
 #include <vector>
+#include <array>
 #include <algorithm>
 #include <numeric>
 #include <cmath>
 #include <cstdio>
+#include <cstdarg>
 #include <utility>
+#include <ctime>
 
 #include "gtest/gtest.h"
 
@@ -57,9 +60,9 @@ namespace cstone
 //  After editing, rebuild and re-run the benchmark.
 // ════════════════════════════════════════════════════════════════════════════════
 
-//  numWarps values to benchmark (consumer warps per block = numWarps - 1).
+//  numWarps values to benchmark (consumer warps per block = numWarps - kProducerWarpsPerBlock).
 //  Edit the values inside the angle brackets:
-using TuneWarpList = std::integer_sequence<int, 4, 5, 6>;
+using TuneWarpList = std::integer_sequence<int, 5, 6, 7, 8>;
 
 //  blocksPerCluster — fixed for all configurations (not tuned):
 static constexpr unsigned kBpc = 8;
@@ -86,11 +89,11 @@ struct TuneParams
 static constexpr TuneParams defaults(unsigned sc)
 {
     return {sc,
-            128,                          // chunkSize
+            256,                          // chunkSize
             640,                      // forcePush
             448,                     // attemptPush
-            192,                     // attemptPop
-            64,                     // forcePop
+            64,                     // attemptPop
+            32,                     // forcePop
             256,                          // travChunkSize
             sc - 8 * GpuConfig::warpSize,    // travForcePush
             256,                     // travAttemptPush
@@ -108,70 +111,148 @@ static constexpr TuneParams withTravForcePush  (TuneParams p, unsigned v) { p.tr
 static constexpr TuneParams withTravAttemptPush(TuneParams p, unsigned v) { p.travAttemptPush = v; return p; }
 static constexpr TuneParams withTravAttemptPop (TuneParams p, unsigned v) { p.travAttemptPop  = v; return p; }
 
-//  ┌──────────────────────────────────────────────────────────────────────────┐
-//  │  CONFIGURATION TABLE                                                     │
-//  │  Add, remove, or modify entries freely.  Each entry is one               │
-//  │  TraversalConfig instantiation that will be tested with every numWarps.  │
-//  └──────────────────────────────────────────────────────────────────────────┘
-static constexpr TuneParams tuneConfigs[] = {
-
-    // ── Baseline: vary stackCap with default ratios ──
-    // defaults(512),
-    // defaults(768),
-    defaults(1024),
-    defaults(1280),
-    // defaults(1536),
-
-    // ── Interaction: vary chunkSize (base: defaults(1024)) ──
-    withChunkSize(defaults(1024), 64),
-    withChunkSize(defaults(1024), 128),
-    withChunkSize(defaults(1024), 192),
-    // withChunkSize(defaults(1024), 256),
-
-    // ── Interaction: vary forcePush ──
-    withForcePush(defaults(1024), 480),
-    withForcePush(defaults(1024), 768),
-    withForcePush(defaults(1024), 896),
-
-    // ── Interaction: vary attemptPush ──
-    withAttemptPush(defaults(1024), 192),
-    // withAttemptPush(defaults(1024), 448),
-    withAttemptPush(defaults(1024), 576),
-
-    // ── Interaction: vary attemptPop ──
-    withAttemptPop(defaults(1024), 64),
-    withAttemptPop(defaults(1024), 128),
-    withAttemptPop(defaults(1024), 256),
-    withAttemptPop(defaults(1024), 320),
-
-    // ── Interaction: vary forcePop ──
-    withForcePop(defaults(1024), 32),
-    withForcePop(defaults(1024), 96),
-    withForcePop(defaults(1024), 128),
-    // withForcePop(defaults(1024), 192),
-
-    // ── Traversal: vary travChunkSize ──
-    // withTravChunkSize(defaults(1024), 64),
-    // withTravChunkSize(defaults(1024), 192),
-    // withTravChunkSize(defaults(1024), 320),
-
-    // ── Traversal: vary travForcePush ──
-    withTravForcePush(defaults(1024), 640),
-    withTravForcePush(defaults(1024), 896),
-
-    // ── Traversal: vary travAttemptPush ──
-    // withTravAttemptPush(defaults(1024), 128),
-    // withTravAttemptPush(defaults(1024), 320),
-    // withTravAttemptPush(defaults(1024), 512),
-
-    // ── Traversal: vary travAttemptPop ──
-    // withTravAttemptPop(defaults(1024), 32),
-    withTravAttemptPop(defaults(1024), 50),
-    // withTravAttemptPop(defaults(1024), 128),
-    // withTravAttemptPop(defaults(1024), 192),
+template<size_t MaxConfigs>
+struct TuneConfigBuilder
+{
+    std::array<TuneParams, MaxConfigs> values{};
+    size_t count = 0;
 };
 
-static constexpr size_t numTuneConfigs = sizeof(tuneConfigs) / sizeof(tuneConfigs[0]);
+constexpr size_t kMaxTuneConfigs = 150;
+
+struct BuiltTuneConfigs
+{
+    std::array<TuneParams, kMaxTuneConfigs> values{};
+    size_t count = 0;
+};
+
+consteval bool sameTuneParams(const TuneParams& a, const TuneParams& b)
+{
+    return a.stackCap == b.stackCap &&
+           a.chunkSize == b.chunkSize &&
+           a.forcePush == b.forcePush &&
+           a.attemptPush == b.attemptPush &&
+           a.attemptPop == b.attemptPop &&
+           a.forcePop == b.forcePop &&
+           a.travChunkSize == b.travChunkSize &&
+           a.travForcePush == b.travForcePush &&
+           a.travAttemptPush == b.travAttemptPush &&
+           a.travAttemptPop == b.travAttemptPop;
+}
+
+consteval bool plausibleTuneConfig(const TuneParams& p)
+{
+    if (p.chunkSize == 0) return false;
+    if (p.forcePop > p.attemptPop) return false;
+    if (p.attemptPop >= p.attemptPush) return false;
+    if (p.attemptPush > p.forcePush) return false;
+    // User-guided rule: keep at least one chunk between pop and push attempt bands.
+    if (p.attemptPush - p.attemptPop < p.chunkSize) return false;
+    if (p.forcePush >= p.stackCap) return false;
+
+    if (p.travChunkSize == 0) return false;
+    if (p.travAttemptPop > p.travAttemptPush) return false;
+    // Keep traversal pop/push attempt bands separated by at least one traversal chunk.
+    if (p.travAttemptPush - p.travAttemptPop < p.travChunkSize) return false;
+    if (p.travAttemptPush > p.travForcePush) return false;
+    if (p.travForcePush >= p.stackCap) return false;
+    return true;
+}
+
+template<size_t MaxConfigs>
+consteval void pushUnique(TuneConfigBuilder<MaxConfigs>& b, const TuneParams& p)
+{
+    if (!plausibleTuneConfig(p)) return;
+    for (size_t i = 0; i < b.count; ++i)
+    {
+        if (sameTuneParams(b.values[i], p)) return;
+    }
+    if (b.count < MaxConfigs)
+    {
+        b.values[b.count++] = p;
+    }
+}
+
+consteval BuiltTuneConfigs buildInteractionTuneConfigs()
+{
+    TuneConfigBuilder<kMaxTuneConfigs> b{};
+
+    constexpr unsigned sc = 1024;
+    // Interaction seeds centered on the strongest observed region with nearby variants
+    // to preserve useful coverage when evaluating future kernel optimizations.
+    constexpr std::array<TuneParams, 6> interactionSeeds{
+        TuneParams{sc,  96, 400, 272,  48, 48, 0, 0, 0, 0},
+        TuneParams{sc, 128, 480, 352,  96, 64, 0, 0, 0, 0},
+        TuneParams{sc, 160, 544, 416, 128, 96, 0, 0, 0, 0},
+        TuneParams{sc, 192, 608, 416,  96, 96, 0, 0, 0, 0},
+        TuneParams{sc, 224, 704, 512, 160, 96, 0, 0, 0, 0},
+        TuneParams{sc, 256, 768, 576, 192, 96, 0, 0, 0, 0}
+    };
+
+    struct TravVariant
+    {
+        unsigned chunkSize;
+        unsigned forcePush;
+        unsigned attemptPush;
+        unsigned attemptPop;
+    };
+
+    // 25 traversal variants: dense around top-performing bands (tCS=192, tAP=224)
+    // with deliberate breadth into adjacent bands for robustness testing.
+    constexpr std::array<TravVariant, 25> traversalVariants{{
+        {192, 576, 224, 16},
+        {192, 640, 224, 16},
+        {192, 704, 224, 16},
+        {192, 768, 224, 16},
+        {192, 896, 224, 16},
+        {192, 576, 224, 32},
+        {192, 640, 224, 32},
+        {192, 704, 224, 32},
+        {192, 768, 224, 32},
+        {192, 896, 224, 32},
+        {192, 640, 240, 16},
+        {192, 768, 240, 16},
+        {192, 896, 240, 16},
+        {192, 640, 240, 32},
+        {192, 768, 240, 32},
+        {192, 896, 240, 32},
+        {192, 640, 256, 16},
+        {192, 768, 256, 16},
+        {192, 896, 256, 16},
+        {160, 640, 224, 16},
+        {160, 768, 224, 16},
+        {160, 896, 224, 16},
+        {160, 640, 224, 32},
+        {224, 704, 256, 32},
+        {256, 768, 320, 64}
+    }};
+
+    for (const auto& iSeed : interactionSeeds)
+    {
+        for (const auto& tVar : traversalVariants)
+        {
+            TuneParams p = iSeed;
+            p.travChunkSize = tVar.chunkSize;
+            p.travForcePush = tVar.forcePush;
+            p.travAttemptPush = tVar.attemptPush;
+            p.travAttemptPop = tVar.attemptPop;
+            pushUnique(b, p);
+        }
+    }
+
+    BuiltTuneConfigs out{};
+    out.count = b.count;
+    for (size_t i = 0; i < b.count; ++i) out.values[i] = b.values[i];
+    return out;
+}
+
+static constexpr BuiltTuneConfigs builtTuneConfigs = buildInteractionTuneConfigs();
+static constexpr auto& tuneConfigs = builtTuneConfigs.values;
+static constexpr size_t numTuneConfigs = builtTuneConfigs.count;
+static_assert(numTuneConfigs <= 150,
+              "Per-warp configuration budget exceeded (max 150)");
+static_assert(numTuneConfigs * TuneWarpList::size() <= 1800,
+              "Configured sweep exceeds 1800 total benchmarks");
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  END OF USER-EDITABLE SECTION
@@ -196,6 +277,18 @@ static TuneStats computeStats(std::vector<float>& v)
     return {med, avg, std::sqrt(sq / float(n)), v.front(), v.back()};
 }
 
+static void printDual(FILE* outFile, const char* fmt, ...)
+{
+    char buffer[4096];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+
+    std::printf("%s", buffer);
+    if (outFile) { std::fputs(buffer, outFile); }
+}
+
 // ── Result record ─────────────────────────────────────────────────────────────
 
 struct TuneResult
@@ -207,6 +300,9 @@ struct TuneResult
     unsigned   p2pCount;
     unsigned   iactWHead, iactRHead;   // interaction queue write/read heads
     unsigned   travWHead, travRHead;   // traversal queue write/read heads
+    unsigned   iactSegReadyBusy;       // interaction segReady entries != 0 after kernel
+    unsigned   iactSegCountBusy;       // interaction segCount entries != 0 after kernel
+    unsigned   travSegReadyBusy;       // traversal segReady entries != 0 after kernel
     TuneStats  stats;
 };
 
@@ -307,7 +403,7 @@ __global__ void tuneDualP2PKernel(
         criterion, m2l, p2p);
 }
 
-// ── Benchmark one (numWarps, TravConfig) combination ──────────────────────────
+// ── Benchmark one (numWarps, TravConfig) combination ─────────────────────────
 
 template<int numWarps, class TravConfig, class T>
 TuneResult benchOne(
@@ -322,20 +418,14 @@ TuneResult benchOne(
     unsigned                     nRuns)
 {
     constexpr unsigned tpb = numWarps * GpuConfig::warpSize;
-    TuneResult res{numWarps, params, 0, false, 0, {}};
+    TuneResult res{numWarps, params, 0, false, 0, 0, 0, 0, 0, 0, 0, {}};
 
-    unsigned maxBlks = maxConcurrentBlocks(
-        tuneDualP2PKernel<numWarps, TravConfig, T>, tpb, kBpc);
-    if (maxBlks > 100000u) return res;
-
-    unsigned total = std::min(kBpc * 64u, maxBlks);
-    total = (total / kBpc) * kBpc;
-    if (total == 0) return res;
+    unsigned total = kBpc * 64u;
     res.totalBlocks = int(total);
 
     // ── Allocate global interaction queue ──
     constexpr unsigned gChunk = TravConfig::chunkSize;
-    constexpr unsigned gSegs  = 1024;
+    constexpr unsigned gSegs  = 2048;
     constexpr unsigned gCap   = gSegs * gChunk;
 
     TreeNodeIndex *d_gA, *d_gB;
@@ -353,7 +443,7 @@ TuneResult benchOne(
 
     // ── Allocate global traversal queue ──
     constexpr unsigned tChunk = TravConfig::travChunkSize;
-    constexpr unsigned tSegs  = 1024;
+    constexpr unsigned tSegs  = 2048;
     constexpr unsigned tCap   = tSegs * tChunk;
 
     TreeNodeIndex *d_tA, *d_tB;
@@ -386,7 +476,8 @@ TuneResult benchOne(
         cudaMemset(d_twH, 0, sizeof(unsigned));
         cudaMemset(d_trH, 0, sizeof(unsigned));
         cudaMemset(d_tsR, 0, tSegs * sizeof(unsigned));
-        cudaMemcpy(d_nP, &total, sizeof(unsigned), cudaMemcpyHostToDevice);
+        unsigned producerWarpsTotal = total * 2u;
+        cudaMemcpy(d_nP, &producerWarpsTotal, sizeof(unsigned), cudaMemcpyHostToDevice);
         cudaLaunchKernelEx(&cfg,
             tuneDualP2PKernel<numWarps, TravConfig, T>,
             rawPtr(d_co), rawPtr(d_cen), rawPtr(d_sz),
@@ -405,6 +496,23 @@ TuneResult benchOne(
         cudaMemcpy(&res.iactRHead, d_rH, sizeof(unsigned), cudaMemcpyDeviceToHost);
         cudaMemcpy(&res.travWHead, d_twH, sizeof(unsigned), cudaMemcpyDeviceToHost);
         cudaMemcpy(&res.travRHead, d_trH, sizeof(unsigned), cudaMemcpyDeviceToHost);
+
+        std::vector<unsigned> h_iSegReady(gSegs);
+        std::vector<unsigned> h_iSegCount(gSegs);
+        std::vector<unsigned> h_tSegReady(tSegs);
+        cudaMemcpy(h_iSegReady.data(), d_sR, gSegs * sizeof(unsigned), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_iSegCount.data(), d_segCount, gSegs * sizeof(unsigned), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_tSegReady.data(), d_tsR, tSegs * sizeof(unsigned), cudaMemcpyDeviceToHost);
+
+        res.iactSegReadyBusy =
+            static_cast<unsigned>(std::count_if(h_iSegReady.begin(), h_iSegReady.end(),
+                                                [](unsigned v) { return v != 0u; }));
+        res.iactSegCountBusy =
+            static_cast<unsigned>(std::count_if(h_iSegCount.begin(), h_iSegCount.end(),
+                                                [](unsigned v) { return v != 0u; }));
+        res.travSegReadyBusy =
+            static_cast<unsigned>(std::count_if(h_tSegReady.begin(), h_tSegReady.end(),
+                                                [](unsigned v) { return v != 0u; }));
 
         for (unsigned i = 0; i < nWarm; ++i) timeGpu(run);
 
@@ -482,7 +590,7 @@ void dispatchWarps(
     Box<T> box, unsigned ppb, unsigned* d_cnt,
     unsigned nWarm, unsigned nRuns)
 {
-    printf("\n── numWarps = %d ──────────────────────────────────────────────────────"
+    printf("\n── numWarps = %d ────────────────────────────────"
            "──────────────────────────────────────────────\n", First);
     benchAllConfigs<First, T>(
         std::make_index_sequence<numTuneConfigs>{},
@@ -506,6 +614,24 @@ void tuneP2PBenchmark(unsigned numParticles    = 5000000,
     using KeyType = uint64_t;
     using T       = double;
     Box<T> box{-1, 1};
+
+    std::time_t now = std::time(nullptr);
+    std::tm tmNow{};
+    localtime_r(&now, &tmNow);
+    char resultFileName[128];
+    std::strftime(resultFileName, sizeof(resultFileName), "results-%Y%m%d-%H%M%S.txt", &tmNow);
+    char resultFilePath[256];
+    std::snprintf(resultFilePath, sizeof(resultFilePath), "test/unit_cuda/traversal/tuning/%s", resultFileName);
+    FILE* resultFile = std::fopen(resultFilePath, "w");
+    if (!resultFile)
+    {
+        std::snprintf(resultFilePath, sizeof(resultFilePath), "%s", resultFileName);
+        resultFile = std::fopen(resultFilePath, "w");
+    }
+    if (!resultFile)
+    {
+        std::perror("Could not open result file");
+    }
 
     // ── Build tree from random Gaussian particles ─────────────────────────────
     RandomGaussianCoordinates<T, MortonKey<KeyType>> randomBox(numParticles, box);
@@ -532,8 +658,9 @@ void tuneP2PBenchmark(unsigned numParticles    = 5000000,
     printf("  particles=%u  leaves=%u  nodes=%d  bin=%u\n",
            numParticles, numLeaves, numTreeNodes, particlesPerBin);
     printf("  warmup=%u  runs=%u  bpc=%u (fixed)\n", numWarmup, numRuns, kBpc);
-    printf("  configs=%zu  numWarps values=%zu  total benchmarks=%zu\n",
-           numTuneConfigs, TuneWarpList::size(), numTuneConfigs * TuneWarpList::size());
+    printf("  configs=%zu  numWarps values=%zu  total benchmarks<=%zu\n",
+           numTuneConfigs, TuneWarpList::size(),
+           numTuneConfigs * TuneWarpList::size());
     printf("════════════════════════════════════════════════════════════════════════"
            "══════════════════════════════════════════════════════════════════════\n");
 
@@ -609,11 +736,16 @@ void tuneP2PBenchmark(unsigned numParticles    = 5000000,
     printf("════════════════════════════════════════════════════════════════════════"
            "══════════════════════════════════════════════════════════════════════"
            "════════════════════════════════════\n");
-    printf("  Single traversal baseline: median=%.3f ms\n\n", singleStats.median);
-    printf("  nW |   SC  | iCS  iFP  iAP iAPo iFPo | tCS  tFP  tAP tAPo | blks |"
-           "  median    mean  stddev     min     max  | p2p       | iW/iR       tW/tR       | speedup\n");
-    printf("  ---+-------+-------------------------+---------------------+------+"
-           "------------------------------------------+-----------+-------------------------+---------\n");
+
+    printDual(resultFile, "\n");
+    printDual(resultFile, "════════════════════════════════════════════════════════════════════════"
+                         "══════════════════════════════════════════════════════════════════════"
+                         "════════════════════════════════════\n");
+    printDual(resultFile, "  Single traversal baseline: median=%.3f ms\n\n", singleStats.median);
+    printDual(resultFile, "  nW |   SC  | iCS  iFP  iAP iAPo iFPo | tCS  tFP  tAP tAPo | blks |"
+                         "  median    mean  stddev     min     max  | p2p       | iW/iR       tW/tR       | iRdy iCnt tRdy | speedup\n");
+    printDual(resultFile, "  ---+-------+-------------------------+---------------------+------+"
+                         "------------------------------------------+-----------+-------------------------+---------------+---------\n");
 
     float bestMedian = 1e30f;
     int bestIdx = -1;
@@ -624,14 +756,15 @@ void tuneP2PBenchmark(unsigned numParticles    = 5000000,
         const auto& r = results[i];
         if (!r.valid)
         {
-            printf("  %2d | %5u | %3u %4u %4u %3u %4u | %3u %4u %4u %3u | %4s |"
-                   " %-40s | --        | --                      | --\n",
-                   r.numWarps, r.params.stackCap,
-                   r.params.chunkSize, r.params.forcePush, r.params.attemptPush,
-                   r.params.attemptPop, r.params.forcePop,
-                   r.params.travChunkSize, r.params.travForcePush,
-                   r.params.travAttemptPush, r.params.travAttemptPop,
-                   "--", "SKIPPED");
+            printDual(resultFile,
+                      "  %2d | %5u | %3u %4u %4u %3u %4u | %3u %4u %4u %3u | %4s |"
+                      " %-40s | --        | --                      | --             | --\n",
+                      r.numWarps, r.params.stackCap,
+                      r.params.chunkSize, r.params.forcePush, r.params.attemptPush,
+                      r.params.attemptPop, r.params.forcePop,
+                      r.params.travChunkSize, r.params.travForcePush,
+                      r.params.travAttemptPush, r.params.travAttemptPop,
+                      "--", "SKIPPED");
             continue;
         }
 
@@ -639,19 +772,22 @@ void tuneP2PBenchmark(unsigned numParticles    = 5000000,
         const char* note = (r.p2pCount != refCount) ? " MISMATCH!" : "";
 
         float speedup = singleStats.median / r.stats.median;
-        printf("  %2d | %5u | %3u %4u %4u %3u %4u | %3u %4u %4u %3u | %4d |"
-               " %7.3f %7.3f %7.3f %7.3f %7.3f | %-9u | %6u/%-6u %6u/%-6u | %5.2fx%s\n",
-               r.numWarps, r.params.stackCap,
-               r.params.chunkSize, r.params.forcePush, r.params.attemptPush,
-               r.params.attemptPop, r.params.forcePop,
-               r.params.travChunkSize, r.params.travForcePush,
-               r.params.travAttemptPush, r.params.travAttemptPop,
-               r.totalBlocks,
-               r.stats.median, r.stats.mean, r.stats.stddev,
-               r.stats.minVal, r.stats.maxVal,
-               r.p2pCount,
-               r.iactWHead, r.iactRHead, r.travWHead, r.travRHead,
-               speedup, note);
+
+        printDual(resultFile,
+                  "  %2d | %5u | %3u %4u %4u %3u %4u | %3u %4u %4u %3u | %4d |"
+                  " %7.3f %7.3f %7.3f %7.3f %7.3f | %-9u | %6u/%-6u %6u/%-6u | %4u %4u %4u | %5.2fx%s\n",
+                  r.numWarps, r.params.stackCap,
+                  r.params.chunkSize, r.params.forcePush, r.params.attemptPush,
+                  r.params.attemptPop, r.params.forcePop,
+                  r.params.travChunkSize, r.params.travForcePush,
+                  r.params.travAttemptPush, r.params.travAttemptPop,
+                  r.totalBlocks,
+                  r.stats.median, r.stats.mean, r.stats.stddev,
+                  r.stats.minVal, r.stats.maxVal,
+                  r.p2pCount,
+                  r.iactWHead, r.iactRHead, r.travWHead, r.travRHead,
+                  r.iactSegReadyBusy, r.iactSegCountBusy, r.travSegReadyBusy,
+                  speedup, note);
 
         if (r.stats.median < bestMedian)
         {
@@ -660,25 +796,58 @@ void tuneP2PBenchmark(unsigned numParticles    = 5000000,
         }
     }
 
-    printf("  ---+-------+-------------------------+---------------------+------+"
-           "------------------------------------------+-----------+-------------------------+---------\n");
+    printDual(resultFile,
+              "  ---+-------+-------------------------+---------------------+------+"
+              "------------------------------------------+-----------+-------------------------+---------------+---------\n");
 
     if (bestIdx >= 0)
     {
         const auto& b = results[bestIdx];
         float bestSpeedup = singleStats.median / b.stats.median;
-        printf("\n  BEST:  nW=%d  SC=%u  iCS=%u iFP=%u iAP=%u iAPo=%u iFPo=%u  "
-               "tCS=%u tFP=%u tAP=%u tAPo=%u  blks=%d  =>  median=%.3f ms  (%.2fx vs single)\n",
-               b.numWarps, b.params.stackCap,
-               b.params.chunkSize, b.params.forcePush, b.params.attemptPush,
-               b.params.attemptPop, b.params.forcePop,
-               b.params.travChunkSize, b.params.travForcePush,
-               b.params.travAttemptPush, b.params.travAttemptPop,
-               b.totalBlocks, b.stats.median, bestSpeedup);
+        printDual(resultFile,
+                  "\n  BEST:  nW=%d  SC=%u  iCS=%u iFP=%u iAP=%u iAPo=%u iFPo=%u  "
+                  "tCS=%u tFP=%u tAP=%u tAPo=%u  blks=%d  =>  median=%.3f ms  (%.2fx vs single)\n",
+                  b.numWarps, b.params.stackCap,
+                  b.params.chunkSize, b.params.forcePush, b.params.attemptPush,
+                  b.params.attemptPop, b.params.forcePop,
+                  b.params.travChunkSize, b.params.travForcePush,
+                  b.params.travAttemptPush, b.params.travAttemptPop,
+                  b.totalBlocks, b.stats.median, bestSpeedup);
     }
+
+    std::vector<TuneResult> fastest;
+    fastest.reserve(results.size());
+    for (const auto& r : results)
+    {
+        if (r.valid) fastest.push_back(r);
+    }
+    std::sort(fastest.begin(), fastest.end(),
+              [](const TuneResult& a, const TuneResult& b) { return a.stats.median < b.stats.median; });
+
+    size_t topN = std::min<size_t>(25, fastest.size());
+    printDual(resultFile, "\nTop %zu Fastest Runs:\n", topN);
+    printDual(resultFile, "  rk | nW | iCS  iFP  iAP iAPo iFPo | median    mean  stddev | speedup\n");
+    printDual(resultFile, "  ---+----+-------------------------+--------------------------+--------\n");
+    for (size_t i = 0; i < topN; ++i)
+    {
+        const auto& r = fastest[i];
+        float speedup = singleStats.median / r.stats.median;
+        printDual(resultFile,
+                  "  %2zu | %2d | %3u %4u %4u %3u %4u | %7.3f %7.3f %7.3f | %6.2fx\n",
+                  i + 1,
+                  r.numWarps,
+                  r.params.chunkSize, r.params.forcePush, r.params.attemptPush,
+                  r.params.attemptPop, r.params.forcePop,
+                  r.stats.median, r.stats.mean, r.stats.stddev,
+                  speedup);
+    }
+
+    printDual(resultFile, "\nResult file: %s\n", resultFilePath);
     printf("════════════════════════════════════════════════════════════════════════"
            "══════════════════════════════════════════════════════════════════════"
            "════════════════════════════════════\n");
+
+    if (resultFile) std::fclose(resultFile);
 
     cudaFree(d_count);
 }

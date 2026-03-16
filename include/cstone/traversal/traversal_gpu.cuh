@@ -78,6 +78,8 @@ constexpr std::size_t align_up(std::size_t x, std::size_t a)
 namespace cstone
 {
 
+constexpr unsigned kProducerWarpsPerBlock = 2;
+
 template<class Kernel>
 unsigned maxConcurrentBlocks(Kernel kernel,
                                    unsigned threadsPerBlock,
@@ -149,6 +151,21 @@ __device__ __forceinline__ void releaseFlag(unsigned* flag)
 {
     __threadfence_block();
     atomicExch(flag, 0u);
+}
+
+/*! @brief Bounded backoff for hot spin loops to reduce contention pressure. */
+__device__ __forceinline__ void spinBackoff(unsigned iter)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+    if (iter >= 8)
+    {
+        unsigned shift = iter - 8;
+        if (shift > 8) shift = 8;
+        __nanosleep(1u << shift);
+    }
+#else
+    (void)iter;
+#endif
 }
 
 
@@ -360,6 +377,16 @@ __device__ __forceinline__ bool isLeaf(const TreeNodeIndex* __restrict__ childOf
     return childOffsets[n] == 0;
 }
 
+__device__ __forceinline__ TreeNodeIndex childOffsetLoad(const TreeNodeIndex* __restrict__ childOffsets,
+                                                         TreeNodeIndex n)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 350)
+    return __ldg(childOffsets + n);
+#else
+    return childOffsets[n];
+#endif
+}
+
 template<class MAC>
 __device__ __forceinline__ bool splitSafe(const TreeNodeIndex* __restrict__ childOffsets,
                                          TreeNodeIndex a, TreeNodeIndex b,
@@ -394,49 +421,163 @@ __device__ __forceinline__ void decode_base8_digits(unsigned rid, unsigned L, un
 
 template<class MAC>
 __device__ __forceinline__
-bool assignPairBySplitting_regress(const TreeNodeIndex* __restrict__ childOffsets,
-                                  TreeNodeIndex& a, TreeNodeIndex& b,
-                                  unsigned rid, unsigned N,
-                                  unsigned& active_count,
-                                  MAC&& continuation)
+bool assignPairByFrontierDeterministic(const TreeNodeIndex* __restrict__ childOffsets,
+                                       TreeNodeIndex& a, TreeNodeIndex& b,
+                                       unsigned rid, unsigned N,
+                                       unsigned& active_count,
+                                       MAC&& continuation)
 {
-    if (N <= 1) { active_count = 1; return rid == 0; }
+    constexpr unsigned kMaxSeedPairs = 256;
 
-    const unsigned L_target = ceil_log8(N);
-    unsigned digits[16];
-    if (L_target > 16) { active_count = 1; return rid == 0; }
-    decode_base8_digits(rid, L_target, digits);
-
-    // Track last safe snapshot
-    TreeNodeIndex a_safe = a, b_safe = b;
-    unsigned L_safe = 0;               // number of split levels safely applied
-    // unsigned digits_safe[16];          // prefix digits that were safely applied
-
-    // Try to split up to L_target levels, but stop at first unsafe.
-    for (unsigned level = 0; level < L_target; ++level)
+    if (N == 0)
     {
-        if (!splitSafe(childOffsets, a, b, continuation))
-        {
-            // Regress to last safe state
-            a = a_safe; b = b_safe;
-            break;
-        }
-
-        const unsigned oct = digits[level];
-
-        if (a < b) a = childOffsets[a] + (TreeNodeIndex)oct;
-        else       b = childOffsets[b] + (TreeNodeIndex)oct;
-
-        a_safe = a;
-        b_safe = b;
-        L_safe = level + 1;
+        active_count = 0;
+        return false;
     }
 
-    const unsigned fanout = pow8(L_safe);
-    active_count = (fanout < N) ? fanout : N;
+    cg::thread_block block = cg::this_thread_block();
+    unsigned tid = block.thread_rank();
 
-    // If we couldn't safely split even once, fanout=1 -> only rid==0 active.
-    return rid < active_count;
+    __shared__ TreeNodeIndex frontierA0[kMaxSeedPairs];
+    __shared__ TreeNodeIndex frontierB0[kMaxSeedPairs];
+    __shared__ TreeNodeIndex frontierA1[kMaxSeedPairs];
+    __shared__ TreeNodeIndex frontierB1[kMaxSeedPairs];
+
+    __shared__ unsigned frontierSize;
+    __shared__ unsigned useFirst;
+    __shared__ unsigned continueSplit;
+
+    __shared__ unsigned canSplit[kMaxSeedPairs];
+    __shared__ unsigned splitAFlag[kMaxSeedPairs];
+    __shared__ TreeNodeIndex splitAOffset[kMaxSeedPairs];
+    __shared__ TreeNodeIndex splitBOffset[kMaxSeedPairs];
+
+    unsigned target = min(N, kMaxSeedPairs);
+
+    if (tid == 0)
+    {
+        frontierA0[0] = a;
+        frontierB0[0] = b;
+        frontierSize = 1;
+        useFirst = 1;
+    }
+    block.sync();
+
+    while (true)
+    {
+        unsigned localSize = frontierSize;
+        auto readA = useFirst ? frontierA0 : frontierA1;
+        auto readB = useFirst ? frontierB0 : frontierB1;
+
+        for (unsigned i = tid; i < localSize; i += block.size())
+        {
+            TreeNodeIndex ai = readA[i];
+            TreeNodeIndex bi = readB[i];
+
+            TreeNodeIndex aCo = childOffsetLoad(childOffsets, ai);
+            TreeNodeIndex bCo = childOffsetLoad(childOffsets, bi);
+            bool aLeaf = (aCo == 0);
+            bool bLeaf = (bCo == 0);
+            bool cont = continuation(ai, bi);
+
+            bool can = false;
+            bool splitA = false;
+            if (cont)
+            {
+                if (aLeaf && bLeaf)
+                {
+                    can = false;
+                }
+                else if (aLeaf)
+                {
+                    can = true;
+                    splitA = false;
+                }
+                else if (bLeaf)
+                {
+                    can = true;
+                    splitA = true;
+                }
+                else
+                {
+                    can = true;
+                    splitA = (ai < bi);
+                }
+            }
+
+            canSplit[i] = can ? 1u : 0u;
+            splitAFlag[i] = splitA ? 1u : 0u;
+            splitAOffset[i] = aCo;
+            splitBOffset[i] = bCo;
+        }
+        block.sync();
+
+        if (tid == 0)
+        {
+            unsigned splitCandidates = 0;
+            for (unsigned i = 0; i < localSize; ++i) splitCandidates += canSplit[i];
+
+            unsigned splitBudget = (target > localSize) ? (target - localSize) / 7u : 0u;
+            unsigned chosenSplits = min(splitCandidates, splitBudget);
+
+            if (chosenSplits == 0)
+            {
+                continueSplit = 0;
+            }
+            else
+            {
+                auto writeA = useFirst ? frontierA1 : frontierA0;
+                auto writeB = useFirst ? frontierB1 : frontierB0;
+
+                unsigned out = 0;
+                unsigned used = 0;
+                for (unsigned i = 0; i < localSize; ++i)
+                {
+                    TreeNodeIndex ai = readA[i];
+                    TreeNodeIndex bi = readB[i];
+
+                    if (canSplit[i] && used < chosenSplits)
+                    {
+                        bool splitA = (splitAFlag[i] != 0u);
+                        TreeNodeIndex aCo = splitAOffset[i];
+                        TreeNodeIndex bCo = splitBOffset[i];
+                        for (unsigned oct = 0; oct < 8; ++oct)
+                        {
+                            writeA[out] = splitA ? (aCo + TreeNodeIndex(oct)) : ai;
+                            writeB[out] = splitA ? bi : (bCo + TreeNodeIndex(oct));
+                            ++out;
+                        }
+                        ++used;
+                    }
+                    else
+                    {
+                        writeA[out] = ai;
+                        writeB[out] = bi;
+                        ++out;
+                    }
+                }
+
+                frontierSize = out;
+                useFirst ^= 1u;
+                continueSplit = 1;
+            }
+        }
+        block.sync();
+
+        if (!continueSplit) break;
+    }
+
+    active_count = frontierSize;
+
+    bool active = rid < active_count;
+    if (active)
+    {
+        auto finalA = useFirst ? frontierA0 : frontierA1;
+        auto finalB = useFirst ? frontierB0 : frontierB1;
+        a = finalA[rid];
+        b = finalB[rid];
+    }
+    return active;
 }
 
 
@@ -485,7 +626,11 @@ __device__ __forceinline__ bool tryPushToGlobal(
     // Phase 2: wait for our segment to become free (bounded: only one specific pop can hold it)
     unsigned seg = wHead % gq.numSegments;
     if (lane == 0) {
-        while (atomicAdd(&gq.segReady[seg], 0u) != 0u) {}
+        for (unsigned spin = 0;; ++spin)
+        {
+            if (atomicAdd(&gq.segReady[seg], 0u) == 0u) break;
+            spinBackoff(spin);
+        }
     }
     tile.sync();
 
@@ -493,7 +638,7 @@ __device__ __forceinline__ bool tryPushToGlobal(
     unsigned base      = seg * chunk;
 
     unsigned count;
-    if (lane == 0) count = atomicAdd(bufCount, 0u);
+    if (lane == 0) count = *bufCount;
     count = tile.shfl(count, 0);
 
     unsigned numPushed = min(chunk, count);
@@ -508,9 +653,9 @@ __device__ __forceinline__ bool tryPushToGlobal(
     // Phase 4: publish data and update count
     __threadfence();
     if (lane == 0) {
-        atomicSub(bufCount, numPushed);
+        *bufCount = count - numPushed;
         gq.segCount[seg] = numPushed;
-        __threadfence_block();
+        __threadfence();
         atomicExch(&gq.segReady[seg], 1u);
     }
     return true;
@@ -566,7 +711,11 @@ __device__ __forceinline__ bool tryPopFromGlobal(
     // Phase 2: wait for our segment's data to be published (bounded: one specific push)
     unsigned seg = rHead % gq.numSegments;
     if (lane == 0) {
-        while (atomicAdd(&gq.segReady[seg], 0u) != 1u) {}
+        for (unsigned spin = 0;; ++spin)
+        {
+            if (atomicAdd(&gq.segReady[seg], 0u) == 1u) break;
+            spinBackoff(spin);
+        }
     }
     tile.sync();
     __threadfence();
@@ -578,16 +727,35 @@ __device__ __forceinline__ bool tryPopFromGlobal(
     if (lane == 0) validCount = gq.segCount[seg];
     validCount = tile.shfl(validCount, 0);
 
-    // Acquire ibFlag to safely write into the local interaction buffer
-    bool success = false;
-    while (!success) {
+    // Acquire ibFlag and wait for enough local IB space before appending.
+    unsigned tail = 0;
+    unsigned count = 0;
+    bool haveSpace = false;
+    while (!haveSpace)
+    {
+        bool success = false;
         if (lane == 0) success = acquireFlag(ibFlag);
         success = tile.shfl(success, 0);
+        if (!success)
+        {
+            if (lane == 0) spinBackoff(8);
+            continue;
+        }
+
+        if (lane == 0)
+        {
+            tail = *bufTail;
+            count = *bufCount;
+            haveSpace = (count + validCount <= TravConfig::stackCap);
+            if (!haveSpace) releaseFlag(ibFlag);
+            if (!haveSpace) spinBackoff(8);
+        }
+        tail = tile.shfl(tail, 0);
+        count = tile.shfl(count, 0);
+        haveSpace = tile.shfl(haveSpace, 0);
     }
 
     // Phase 3: enqueue valid items into the local ring queue tail.
-    unsigned tail = *bufTail;
-    unsigned count = *bufCount;
     for (unsigned j = lane; j < validCount; j += tile.num_threads())
     {
         unsigned writeIdx = tail + j;
@@ -607,6 +775,7 @@ __device__ __forceinline__ bool tryPopFromGlobal(
         (void)bufHead;
         releaseFlag(ibFlag);
         gq.segCount[seg] = 0u;
+        __threadfence();
         atomicExch(&gq.segReady[seg], 0u);
     }
     return true;
@@ -654,7 +823,11 @@ __device__ __forceinline__ bool tryPushTraversalToGlobal(
     // Phase 2: wait for our segment to become free (bounded: only one specific pop can hold it)
     unsigned seg = wHead % gq.numSegments;
     if (lane == 0) {
-        while (atomicAdd(&gq.segReady[seg], 0u) != 0u) {}
+        for (unsigned spin = 0;; ++spin)
+        {
+            if (atomicAdd(&gq.segReady[seg], 0u) == 0u) break;
+            spinBackoff(spin);
+        }
     }
     tile.sync();
 
@@ -672,8 +845,8 @@ __device__ __forceinline__ bool tryPushTraversalToGlobal(
     // Phase 4: publish data and update count
     __threadfence();
     if (lane == 0) {
-        atomicSub(bufCount, chunk);
-        __threadfence_block();
+        *bufCount = count - chunk;
+        __threadfence();
         atomicExch(&gq.segReady[seg], 1u);
     }
     return true;
@@ -721,7 +894,11 @@ __device__ __forceinline__ bool tryPopTraversalFromGlobal(
     // Phase 2: wait for our segment's data to be published (bounded: one specific push)
     unsigned seg = rHead % gq.numSegments;
     if (lane == 0) {
-        while (atomicAdd(&gq.segReady[seg], 0u) != 1u) {}
+        for (unsigned spin = 0;; ++spin)
+        {
+            if (atomicAdd(&gq.segReady[seg], 0u) == 1u) break;
+            spinBackoff(spin);
+        }
     }
     tile.sync();
     __threadfence();
@@ -738,8 +915,8 @@ __device__ __forceinline__ bool tryPopTraversalFromGlobal(
 
     // Phase 4: update count and free the segment
     if (lane == 0) {
-        atomicAdd(bufCount, chunk);
-        __threadfence_block();
+        *bufCount = count + chunk;
+        __threadfence();
         atomicExch(&gq.segReady[seg], 0u);
     }
     return true;
@@ -756,10 +933,14 @@ __device__ void dualTraversalBlock(
     MAC&& continuation, M2L&& m2l, P2P&& p2p)
 {
     constexpr unsigned stackCap = TravConfig::stackCap;
+    constexpr unsigned producerWarpCount = kProducerWarpsPerBlock;
+    static_assert(numWarps >= producerWarpCount, "dualTraversalBlock requires at least 2 warps");
+    constexpr unsigned tmpCap = GpuConfig::warpSize * 8;
 
     cg::thread_block block = cg::this_thread_block();
     unsigned tid    = block.thread_rank();
-    unsigned lane = lane_id();
+    unsigned lane   = lane_id();
+    unsigned warpId = tid / GpuConfig::warpSize;
 
     __shared__ TreeNodeIndex interactionBufferA[stackCap];
     __shared__ TreeNodeIndex interactionBufferB[stackCap];
@@ -770,11 +951,24 @@ __device__ void dualTraversalBlock(
     __shared__ unsigned ibFlag; // 0=free, 1=held
 
 
-    __shared__ TreeNodeIndex localStackA[stackCap];
-    __shared__ TreeNodeIndex localStackB[stackCap];
-    __shared__ unsigned localStackTop;
+    __shared__ TreeNodeIndex localStackA[producerWarpCount][stackCap];
+    __shared__ TreeNodeIndex localStackB[producerWarpCount][stackCap];
+    __shared__ unsigned localStackTop[producerWarpCount];
+
+    __shared__ TreeNodeIndex tmpIBA[producerWarpCount][tmpCap];
+    __shared__ TreeNodeIndex tmpIBB[producerWarpCount][tmpCap];
+    __shared__ int           tmpIBP2P[producerWarpCount][tmpCap];
+    __shared__ unsigned      tmpIBCount[producerWarpCount];
+
+    __shared__ TreeNodeIndex smem_parentACO[producerWarpCount][GpuConfig::warpSize];
+    __shared__ TreeNodeIndex smem_parentBCO[producerWarpCount][GpuConfig::warpSize];
+    __shared__ TreeNodeIndex smem_parentA[producerWarpCount][GpuConfig::warpSize];
+    __shared__ TreeNodeIndex smem_parentB[producerWarpCount][GpuConfig::warpSize];
+    __shared__ unsigned      smem_parentSplitA[producerWarpCount][GpuConfig::warpSize];
+    __shared__ unsigned      smem_parentConstLeaf[producerWarpCount][GpuConfig::warpSize];
 
     __shared__ unsigned globalPopFlag;
+    __shared__ unsigned trivialShared;
     auto pRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*numActiveProducers);
     
 
@@ -785,16 +979,23 @@ __device__ void dualTraversalBlock(
         interactionBufferCount = 0;
         ibFlag = 0;
         globalPopFlag = 0;
+        trivialShared = 0;
+        for (unsigned w = 0; w < producerWarpCount; ++w)
+        {
+            localStackTop[w] = 0;
+            tmpIBCount[w] = 0;
+        }
     }
     block.sync();
 
-    producer = producer && (tid < GpuConfig::warpSize);
-    bool trivial = !producer;
+    bool producerBlock = producer;
+    bool isProducerWarp = producerBlock && (warpId < producerWarpCount);
+    bool trivial = !producerBlock;
+    producer = isProducerWarp && !trivial;
 
     // ── Handle trivial cases before entering producer loop ──
-    if (producer)
+    if (producerBlock && warpId == 0)
     {
-        // bool trivial = false;
         if (isLeaf(childOffsets, a) && isLeaf(childOffsets, b))
         {
             // Both leaves: p2p if criterion passes, otherwise skip.
@@ -817,49 +1018,40 @@ __device__ void dualTraversalBlock(
             __threadfence();
             if (tid == 0)
             {
-                unsigned pre = atomicSub(numActiveProducers, 1u);
+                trivialShared = 1;
+                unsigned pre = atomicSub(numActiveProducers, producerWarpCount);
                 // printf("[DECR blk=%u] TRIVIAL path, pre=%u\n", blockIdx.x, pre);
             }
         }
     }
 
-    producer = tid < GpuConfig::warpSize;
+    block.sync();
+    trivial = trivial || (trivialShared != 0);
+
+    producer = isProducerWarp && !trivial;
 
     // ── Producer loop (warp 0 only, skip if trivial) ──
     if (producer)
     {
 
-        // Temporary interaction buffer — one outer-loop iteration produces
-        // at most warpSize × 8 = 256 interaction items.  Writing into a
-        // dedicated buffer first lets us verify that the main IB has room
-        // *before* the merge copy, avoiding any OOB writes.
-        constexpr unsigned tmpCap = GpuConfig::warpSize * 8;
-        __shared__ TreeNodeIndex tmpIBA[tmpCap];
-        __shared__ TreeNodeIndex tmpIBB[tmpCap];
-        __shared__ int           tmpIBP2P[tmpCap];
-        __shared__ unsigned      tmpIBCount;
-
-        // Flattened expansion: parent data for warp-parallel child processing
-        __shared__ TreeNodeIndex smem_parentACO[GpuConfig::warpSize];
-        __shared__ TreeNodeIndex smem_parentBCO[GpuConfig::warpSize];
-        __shared__ TreeNodeIndex smem_parentA[GpuConfig::warpSize];
-        __shared__ TreeNodeIndex smem_parentB[GpuConfig::warpSize];
-        __shared__ unsigned      smem_parentSplitA[GpuConfig::warpSize];
+        const unsigned producerId = warpId;
 
         auto wRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*globalTraversalQueue.writeHead);
         auto rRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*globalTraversalQueue.readHead);
 
         bool currentlySignaledAsActive = !trivial;
 
-        if (tid == 0 && currentlySignaledAsActive)
+        if (lane == 0 && producerId == 0 && currentlySignaledAsActive)
         {
-            localStackA[0] = a;
-            localStackB[0] = b;
-            localStackTop = 1;
-            tmpIBCount = 0;
-        } else if (tid == 0){
-            localStackTop = 0;
-            tmpIBCount = 0;
+            localStackA[producerId][0] = a;
+            localStackB[producerId][0] = b;
+            localStackTop[producerId] = 1;
+            tmpIBCount[producerId] = 0;
+        }
+        else if (lane == 0)
+        {
+            localStackTop[producerId] = 0;
+            tmpIBCount[producerId] = 0;
         }
         __syncwarp();
 
@@ -872,19 +1064,19 @@ __device__ void dualTraversalBlock(
             // Each popped item generates up to 8 children, so we need
             // 8 * popCount free slots on the stack after the pop.
             unsigned curStackTop_;
-            if (tid == 0) curStackTop_ = atomicAdd(&localStackTop, 0u);
+            if (lane == 0) curStackTop_ = localStackTop[producerId];
             curStackTop_ = __shfl_sync(0xFFFFFFFFu, curStackTop_, 0);
             unsigned room = (stackCap > curStackTop_) ? (stackCap - curStackTop_) : 0;
             unsigned maxPop = room / 7;
             unsigned popCount = min(min(curStackTop_, (unsigned)GpuConfig::warpSize), maxPop);
-            if (tid < popCount)
+            if (lane < popCount)
             {
-                unsigned readIdx = curStackTop_ - 1 - tid;
+                unsigned readIdx = curStackTop_ - 1 - lane;
                 // assert(readIdx < stackCap && "Producer stack pop: readIdx OOB");
-                a = localStackA[readIdx];
-                b = localStackB[readIdx];
+                a = localStackA[producerId][readIdx];
+                b = localStackB[producerId][readIdx];
             }
-            if (tid == 0) localStackTop -= popCount;
+            if (lane == 0) localStackTop[producerId] -= popCount;
             __syncwarp();
 
             // ── Optimization 1: Flattened child expansion across the warp ──
@@ -895,29 +1087,32 @@ __device__ void dualTraversalBlock(
                 TreeNodeIndex aCO_ = 0, bCO_ = 0;
                 bool splitA_ = false;
                 bool hasChildren = false;
+                bool constSideLeaf_ = false;
 
-                if (tid < popCount)
+                if (lane < popCount)
                 {
-                    aCO_ = childOffsets[a];
-                    bCO_ = childOffsets[b];
+                    aCO_ = childOffsetLoad(childOffsets, a);
+                    bCO_ = childOffsetLoad(childOffsets, b);
                     bool aIsLeaf = (aCO_ == 0);
                     bool bIsLeaf = (bCO_ == 0);
                     splitA_ = (a < b && !aIsLeaf) || bIsLeaf;
                     hasChildren = splitA_ ? !aIsLeaf : !bIsLeaf;
+                    constSideLeaf_ = splitA_ ? bIsLeaf : aIsLeaf;
                 }
 
                 // Compact parents with children into contiguous smem slots
                 unsigned hasMask = __ballot_sync(0xFFFFFFFFu, hasChildren);
-                unsigned compIdx = __popc(hasMask & ((1u << tid) - 1));
+                unsigned compIdx = __popc(hasMask & ((1u << lane) - 1));
                 unsigned numActiveParents = __popc(hasMask);
 
                 if (hasChildren)
                 {
-                    smem_parentACO[compIdx]    = aCO_;
-                    smem_parentBCO[compIdx]    = bCO_;
-                    smem_parentA[compIdx]      = a;
-                    smem_parentB[compIdx]      = b;
-                    smem_parentSplitA[compIdx] = splitA_ ? 1u : 0u;
+                    smem_parentACO[producerId][compIdx]    = aCO_;
+                    smem_parentBCO[producerId][compIdx]    = bCO_;
+                    smem_parentA[producerId][compIdx]      = a;
+                    smem_parentB[producerId][compIdx]      = b;
+                    smem_parentSplitA[producerId][compIdx] = splitA_ ? 1u : 0u;
+                    smem_parentConstLeaf[producerId][compIdx] = constSideLeaf_ ? 1u : 0u;
                 }
                 __syncwarp();
 
@@ -927,7 +1122,7 @@ __device__ void dualTraversalBlock(
 
                 for (unsigned round = 0; round < numRounds; ++round)
                 {
-                    unsigned flatIdx = round * GpuConfig::warpSize + tid;
+                    unsigned flatIdx = round * GpuConfig::warpSize + lane;
                     bool active = flatIdx < totalChildren;
 
                     TreeNodeIndex childA = 0, childB = 0;
@@ -938,15 +1133,29 @@ __device__ void dualTraversalBlock(
                     {
                         unsigned pIdx = flatIdx >> 3;   // / 8
                         unsigned cOff = flatIdx & 7;    // % 8
-                        bool pSplitA = smem_parentSplitA[pIdx];
-                        childA = pSplitA ? smem_parentACO[pIdx] + (TreeNodeIndex)cOff
-                                         : smem_parentA[pIdx];
-                        childB = pSplitA ? smem_parentB[pIdx]
-                                         : smem_parentBCO[pIdx] + (TreeNodeIndex)cOff;
+                        bool pSplitA = smem_parentSplitA[producerId][pIdx];
+                        childA = pSplitA ? smem_parentACO[producerId][pIdx] + (TreeNodeIndex)cOff
+                                         : smem_parentA[producerId][pIdx];
+                        childB = pSplitA ? smem_parentB[producerId][pIdx]
+                                         : smem_parentBCO[producerId][pIdx] + (TreeNodeIndex)cOff;
                         cont = continuation(childA, childB);
-                        bool childAIsLeaf = (childOffsets[childA] == 0);
-                        bool childBIsLeaf = (childOffsets[childB] == 0);
-                        isTraversal = cont && !(childAIsLeaf && childBIsLeaf) ? 1 : 0;
+                        if (cont)
+                        {
+                            bool constSideLeaf = (smem_parentConstLeaf[producerId][pIdx] != 0u);
+                            bool childAIsLeaf;
+                            bool childBIsLeaf;
+                            if (pSplitA)
+                            {
+                                childAIsLeaf = (childOffsetLoad(childOffsets, childA) == 0);
+                                childBIsLeaf = constSideLeaf;
+                            }
+                            else
+                            {
+                                childAIsLeaf = constSideLeaf;
+                                childBIsLeaf = (childOffsetLoad(childOffsets, childB) == 0);
+                            }
+                            isTraversal = !(childAIsLeaf && childBIsLeaf) ? 1 : 0;
+                        }
                     }
 
                     bool isInteraction = active && !isTraversal;
@@ -955,30 +1164,32 @@ __device__ void dualTraversalBlock(
                     unsigned travMask = __ballot_sync(0xFFFFFFFFu, isTraversal);
                     unsigned iactMask = __ballot_sync(0xFFFFFFFFu, isInteraction);
 
-                    unsigned travPos   = __popc(travMask & ((1u << tid) - 1));
+                    unsigned travPos   = __popc(travMask & ((1u << lane) - 1));
                     unsigned totalTrav = __popc(travMask);
-                    unsigned iactPos   = __popc(iactMask & ((1u << tid) - 1));
+                    unsigned iactPos   = __popc(iactMask & ((1u << lane) - 1));
                     unsigned totalIact = __popc(iactMask);
 
                     unsigned curStackTop, curTmpCount;
-                    if (tid == 0)
+                    if (lane == 0)
                     {
-                        curStackTop = atomicAdd(&localStackTop, totalTrav);
-                        curTmpCount = atomicAdd(&tmpIBCount, totalIact);
+                        curStackTop = localStackTop[producerId];
+                        curTmpCount = tmpIBCount[producerId];
+                        localStackTop[producerId] = curStackTop + totalTrav;
+                        tmpIBCount[producerId] = curTmpCount + totalIact;
                     }
                     curStackTop = __shfl_sync(0xFFFFFFFFu, curStackTop, 0);
                     curTmpCount = __shfl_sync(0xFFFFFFFFu, curTmpCount, 0);
 
                     if (isTraversal)
                     {
-                        localStackA[curStackTop + travPos] = childA;
-                        localStackB[curStackTop + travPos] = childB;
+                        localStackA[producerId][curStackTop + travPos] = childA;
+                        localStackB[producerId][curStackTop + travPos] = childB;
                     }
                     else if (isInteraction)
                     {
-                        tmpIBA[curTmpCount + iactPos]   = childA;
-                        tmpIBB[curTmpCount + iactPos]   = childB;
-                        tmpIBP2P[curTmpCount + iactPos] = cont ? 1 : 0;
+                        tmpIBA[producerId][curTmpCount + iactPos]   = childA;
+                        tmpIBB[producerId][curTmpCount + iactPos]   = childB;
+                        tmpIBP2P[producerId][curTmpCount + iactPos] = cont ? 1 : 0;
                     }
 
                     // Optimization 2: opportunistic mid-expansion drain to IB.
@@ -1017,9 +1228,9 @@ __device__ void dualTraversalBlock(
             for (;;) {
                 unsigned ibCount, curTmpIB, lstop;
                 if (lane == 0) {
-                    curTmpIB = atomicAdd(&tmpIBCount, 0u);
+                    curTmpIB = tmpIBCount[producerId];
                     ibCount  = atomicAdd(&interactionBufferCount, 0u);
-                    lstop    = atomicAdd(&localStackTop, 0u);
+                    lstop    = localStackTop[producerId];
                 }
                 curTmpIB = __shfl_sync(0xFFFFFFFFu, curTmpIB, 0);
                 ibCount  = __shfl_sync(0xFFFFFFFFu, ibCount, 0);
@@ -1027,29 +1238,29 @@ __device__ void dualTraversalBlock(
                 if (curTmpIB == 0) break;
 
                 if (ibCount > TravConfig::forcePush || (ibCount + curTmpIB > TravConfig::stackCap)) {
-                    if (tryPushToGlobal<TravConfig>(globalQueue, tmpIBA, tmpIBB, tmpIBP2P, &tmpIBCount, true)) {}
+                    if (tryPushToGlobal<TravConfig>(globalQueue, tmpIBA[producerId], tmpIBB[producerId], tmpIBP2P[producerId], &tmpIBCount[producerId], true)) {}
                     else if (lstop > TravConfig::travAttemptPush) {
-                        tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, false);
+                        tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA[producerId], localStackB[producerId], &localStackTop[producerId], false);
                     }
                 } else if (ibCount > TravConfig::attemptPush) {
-                    if (tryPushToGlobal<TravConfig>(globalQueue, tmpIBA, tmpIBB, tmpIBP2P, &tmpIBCount, false)) {}
+                    if (tryPushToGlobal<TravConfig>(globalQueue, tmpIBA[producerId], tmpIBB[producerId], tmpIBP2P[producerId], &tmpIBCount[producerId], false)) {}
                     else {
                         if (ibQueuePush<TravConfig::stackCap>(interactionBufferA, interactionBufferB, interactionBufferIsP2P,
                                                               &interactionBufferHead, &interactionBufferTail,
                                                               &interactionBufferCount, &ibFlag,
-                                                              tmpIBA, tmpIBB, tmpIBP2P, curTmpIB)) {
-                            if (lane == 0) atomicExch(&tmpIBCount, 0u);
+                                                              tmpIBA[producerId], tmpIBB[producerId], tmpIBP2P[producerId], curTmpIB)) {
+                            if (lane == 0) tmpIBCount[producerId] = 0;
                         }
                     }
                 } else {
                     if (ibQueuePush<TravConfig::stackCap>(interactionBufferA, interactionBufferB, interactionBufferIsP2P,
                                                           &interactionBufferHead, &interactionBufferTail,
                                                           &interactionBufferCount, &ibFlag,
-                                                          tmpIBA, tmpIBB, tmpIBP2P, curTmpIB)) {
-                        if (lane == 0) atomicExch(&tmpIBCount, 0u);
+                                                          tmpIBA[producerId], tmpIBB[producerId], tmpIBP2P[producerId], curTmpIB)) {
+                        if (lane == 0) tmpIBCount[producerId] = 0;
                     }
                     else if (lstop > TravConfig::travForcePush) {
-                        tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, false);
+                        tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA[producerId], localStackB[producerId], &localStackTop[producerId], false);
                     }
                 }
               
@@ -1072,17 +1283,17 @@ __device__ void dualTraversalBlock(
             // unsigned wHead = 0, rHead = 0;
 
             unsigned curLST;
-            if (tid == 0) curLST = atomicAdd(&localStackTop, 0u);
+            if (lane == 0) curLST = localStackTop[producerId];
             curLST = __shfl_sync(0xFFFFFFFFu, curLST, 0);
             if (curLST >= TravConfig::travForcePush || (curLST + GpuConfig::warpSize * 8 >= stackCap)) {
-                tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, true);
+                tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA[producerId], localStackB[producerId], &localStackTop[producerId], true);
             } else if (curLST > TravConfig::travAttemptPush) {
-                tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, false);
+                tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA[producerId], localStackB[producerId], &localStackTop[producerId], false);
             } else if (curLST == 0) {
                 // unsigned readLocal
                 // do {
-                    if (tryPopTraversalFromGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, true)) {
-                        if (tid == 0 && !currentlySignaledAsActive) {
+                    if (tryPopTraversalFromGlobal<TravConfig>(globalTraversalQueue, localStackA[producerId], localStackB[producerId], &localStackTop[producerId], true)) {
+                        if (lane == 0 && !currentlySignaledAsActive) {
                             atomicAdd(numActiveProducers, 1u);
                             __threadfence(); 
                             // printf("[INCR blk=%u] pop from global, pre=%u\n", blockIdx.x, atomicAdd(numActiveProducers, 0u));
@@ -1091,7 +1302,7 @@ __device__ void dualTraversalBlock(
                         // break;
                     }
                     else {
-                        if (tid == 0 && currentlySignaledAsActive) {
+                        if (lane == 0 && currentlySignaledAsActive) {
                             atomicSub(numActiveProducers, 1u);
                             __threadfence();
                             // printf("[DECR blk=%u] failed pop from global, pre=%u\n", blockIdx.x, atomicAdd(numActiveProducers, 0u));
@@ -1103,13 +1314,13 @@ __device__ void dualTraversalBlock(
                     
                 // } while (localStackTop == 0 && !terminate);
             } else if (curLST <= TravConfig::travAttemptPop) {
-                tryPopTraversalFromGlobal<TravConfig>(globalTraversalQueue, localStackA, localStackB, &localStackTop, false);
+                tryPopTraversalFromGlobal<TravConfig>(globalTraversalQueue, localStackA[producerId], localStackB[producerId], &localStackTop[producerId], false);
             }
            
             __syncwarp();
 
-            if (tid == 0 && !currentlySignaledAsActive) {
-                unsigned localCount = atomicAdd(&localStackTop, 0u);  // force reload from smem
+            if (lane == 0 && !currentlySignaledAsActive) {
+                unsigned localCount = localStackTop[producerId];
                 unsigned producers = pRef.load(cuda::memory_order_acquire);
                 unsigned wHead     = wRef.load(cuda::memory_order_acquire);
                 unsigned rHead     = rRef.load(cuda::memory_order_acquire);
@@ -1144,7 +1355,7 @@ __device__ void dualTraversalBlock(
     // auto pRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*numActiveProducers);
     auto wRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*globalQueue.writeHead);
     auto rRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*globalQueue.readHead);
-    const unsigned warpId = tid / GpuConfig::warpSize;
+    const unsigned refillWarpId = (numWarps > producerWarpCount) ? producerWarpCount : 0u;
     for (;;)
     {
         // consumerSpinCount++;
@@ -1172,7 +1383,7 @@ __device__ void dualTraversalBlock(
         }
         numLocal = tile.shfl(numLocal, 0);
 
-        if (numLocal < TravConfig::attemptPop && warpId == 0) {
+        if (numLocal < TravConfig::attemptPop && warpId == refillWarpId) {
             bool success = false;
             if (lane == 0) success = acquireFlag(&globalPopFlag);
             success = tile.shfl(success, 0);
@@ -1248,15 +1459,15 @@ __device__ void dualTraversalTBC(const TreeNodeIndex* __restrict__ childOffsets,
 
     unsigned active_blocks = 0;
     bool producer =
-        assignPairBySplitting_regress(childOffsets, a, b,
-                                      block_in_cluster, blocksPerCluster,
-                                      active_blocks,
-                                      std::forward<MAC>(continuation));
+        assignPairByFrontierDeterministic(childOffsets, a, b,
+                                          block_in_cluster, blocksPerCluster,
+                                          active_blocks,
+                                          std::forward<MAC>(continuation));
 
     // non-producer blocks decrement active count immediately
     if (!producer && cg::this_thread_block().thread_rank() == 0)
     {
-        unsigned pre = atomicSub(numActiveProducers, 1u);
+        unsigned pre = atomicSub(numActiveProducers, kProducerWarpsPerBlock);
         // printf("[DECR blk=%u] TBC non-producer, pre=%u\n", blockIdx.x, pre);
     }
 
@@ -1284,16 +1495,16 @@ __device__ void dualTraversalGPU(const TreeNodeIndex* __restrict__ childOffsets,
 
     unsigned active_clusters = 0;
     const bool active_cluster =
-        assignPairBySplitting_regress(childOffsets, a, b,
-                                      cluster_id, numClusters,
-                                      active_clusters,
-                                      std::forward<MAC>(continuation));
+        assignPairByFrontierDeterministic(childOffsets, a, b,
+                                          cluster_id, numClusters,
+                                          active_clusters,
+                                          std::forward<MAC>(continuation));
 
     if (!active_cluster)
     {
         if (cg::this_thread_block().thread_rank() == 0)
         {
-            unsigned pre = atomicSub(numActiveProducers, 1u);
+            unsigned pre = atomicSub(numActiveProducers, kProducerWarpsPerBlock);
             // printf("[DECR blk=%u] GPU non-active cluster, pre=%u\n", blockIdx.x, pre);
         }
         return;
