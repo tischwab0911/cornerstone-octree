@@ -324,10 +324,9 @@ struct TraversalQueue
 
         const unsigned base = seg * chunk;
         const unsigned count = *bufCount;
-        const unsigned numPushed = min(chunk, count);
-        for (unsigned i = lane; i < numPushed; i += tile.num_threads())
+        for (unsigned i = lane; i < chunk && i < count; i += tile.num_threads())
         {
-            const unsigned srcIdx = count - numPushed + i;
+            const unsigned srcIdx = count - chunk + i;
             nodeA[base + i] = bufA[srcIdx];
             nodeB[base + i] = bufB[srcIdx];
         }
@@ -335,7 +334,7 @@ struct TraversalQueue
         __threadfence();
         if (lane == 0)
         {
-            *bufCount = count - numPushed;
+            *bufCount = count - chunk;
             __threadfence();
             atomicExch(&segReady[seg], 1u);
         }
