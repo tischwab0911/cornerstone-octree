@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install CMake & Ninja
-        run: apt-get update && apt-get install -y cmake ninja-build
+        run: apt-get update && apt-get install -y cmake ninja-build git
 
       - name: Configure
         run: |
