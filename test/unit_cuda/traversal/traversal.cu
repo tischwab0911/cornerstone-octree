@@ -31,78 +31,72 @@
 namespace cstone
 {
 
-template<int numConsumersPerBlock>
+using DefaultTravConfig = TraversalConfig<1024>;
+
+template<int numWarps>
 __global__ void dualTraversalCount(const TreeNodeIndex* __restrict__ childOffsets,
                                         TreeNodeIndex rootA,
                                         TreeNodeIndex rootB,
                                         util::array<TreeNodeIndex, 2>* p2pPairs,
                                         util::array<TreeNodeIndex, 2>* m2lPairs,
                                         unsigned* p2pPairCount,
-                                        unsigned* m2lPairCount)
+                                        unsigned* m2lPairCount,
+                                        GlobalWorkQueue globalQueue,
+                                        GlobalTraversalQueue globalTraversalQueue,
+                                        unsigned* numActiveProducers)
 {
     // admissibility criterion: accept all internal node pairs
     auto allPairs = [] __device__(TreeNodeIndex, TreeNodeIndex) { return true; };
 
-    // multipole‑to‑local interaction
+    // multipole-to-local interaction
     auto m2l = [m2lPairs, m2lPairCount] __device__(TreeNodeIndex a, TreeNodeIndex b) {
         unsigned idx = atomicAdd(m2lPairCount, 1u);
         m2lPairs[idx][0] = a;
         m2lPairs[idx][1] = b;
     };
 
-    // particle‑to‑particle interaction: record each leaf pair atomically
+    // particle-to-particle interaction: record each leaf pair atomically
     auto p2p = [p2pPairs, p2pPairCount] __device__(TreeNodeIndex a, TreeNodeIndex b) {
         unsigned idx = atomicAdd(p2pPairCount, 1u);
         p2pPairs[idx][0] = a;
         p2pPairs[idx][1] = b;
     };
-    
-    
-    dualTraversalGPU<numConsumersPerBlock>(childOffsets, rootA, rootB,
-                         allPairs, m2l, p2p);
+
+    dualTraversalGPU<numWarps, DefaultTravConfig>(
+        childOffsets, rootA, rootB,
+        globalQueue, globalTraversalQueue, numActiveProducers,
+        allPairs, m2l, p2p);
 }
 
 struct TravConfig {
 
-    //! @brief number of consumer warps ber block, all warps except warp 0 are consumers
-    static constexpr unsigned numConsumersPerBlock = 3;
+    static constexpr unsigned numWarps = 4;
 
-    /*! @brief number of threads per block for the traversal kernel
-     * number of threads per block for the dual traversal kernel
-     * must be at least 64 and at most 512
-     * must be a multiple of GPU warp size
-     */
-    static constexpr unsigned numThreadsPerBlock = (numConsumersPerBlock + 1) * GpuConfig::warpSize;
+    static constexpr unsigned numThreadsPerBlock = numWarps * GpuConfig::warpSize;
     static_assert(numThreadsPerBlock >= 64 && numThreadsPerBlock <= 512);
 
-    //! @brief number of blocks per thread block cluster, should be a power of 8: (1, 8, 64, ...)
+    //! @brief number of blocks per thread block cluster
     static constexpr unsigned kBlocksPerCluster = 8;
 
-    //! @brief number of TBS in grid, should be a power of 8: (1, 8, 64, ...)
+    //! @brief number of clusters in the grid
     static constexpr unsigned kNumClusters      = 8;
 
     //! @brief total number of blocks launched in the grid
     static constexpr unsigned kTotalBlocks      = kBlocksPerCluster * kNumClusters;
     static_assert(kBlocksPerCluster > 0 && kNumClusters > 0);
 
-    static constexpr unsigned ClusterStackSize = GpuConfig::warpSize * kBlocksPerCluster;
-    static constexpr unsigned OverflowLevel = GpuConfig::warpSize;
-
+    //! @brief per-block shared memory capacity (node-pair slots)
+    static constexpr unsigned stackCap = DefaultTravConfig::stackCap;
 };
 
 template <class KeyType>
 void dualTraversalAllPairsGpu()
 {
-    // Build a simple tree on the CPU with 22 leaves.  The tree
-    // structure follows the same construction as in the CPU test:
-    // start with one node, split once, then split child 0 three more
-    // times to get a total of 22 leaf nodes.
     Octree<KeyType> cpuTree;
     auto leaves = OctreeMaker<KeyType>{}.divide().divide(0).divide(0, 7).divide(7).makeTree();
     cpuTree.update(leaves.data(), nNodes(leaves));
 
-    // Compute the reference set of leaf‑pairs on the CPU using the
-    // existing dualTraversal implementation.
+    // Compute the reference set of leaf-pairs on the CPU
     std::vector<util::array<TreeNodeIndex, 2>> cpum2lPairs;
     std::vector<util::array<TreeNodeIndex, 2>> cpup2pPairs;
     auto allPairsCpu = [](TreeNodeIndex, TreeNodeIndex) { return true; };
@@ -115,7 +109,7 @@ void dualTraversalAllPairsGpu()
     dualTraversal(cpuTree.childOffsets().data(), 0, 0, allPairsCpu, m2lCpu, p2pCpu);
     std::sort(cpup2pPairs.begin(), cpup2pPairs.end());
     std::sort(cpum2lPairs.begin(), cpum2lPairs.end());
-    
+
     cpup2pPairs.erase(std::unique(cpup2pPairs.begin(), cpup2pPairs.end()), cpup2pPairs.end());
     cpum2lPairs.erase(std::unique(cpum2lPairs.begin(), cpum2lPairs.end()), cpum2lPairs.end());
 
@@ -125,12 +119,12 @@ void dualTraversalAllPairsGpu()
     gpuTree.resize(nNodes(leaves));
     buildOctreeGpu(rawPtr(d_leaves), gpuTree.data());
 
-    // Allocate a device buffer large enough to hold all possible pairs.
+    // Allocate device buffers
     const unsigned numP2PPairs = static_cast<unsigned>(cpup2pPairs.size());
     const unsigned numM2LPairs = static_cast<unsigned>(cpum2lPairs.size());
 
-    DeviceVector<util::array<TreeNodeIndex, 2>> d_p2pPairs(numP2PPairs);
-    DeviceVector<util::array<TreeNodeIndex, 2>> d_m2lPairs(numM2LPairs);
+    DeviceVector<util::array<TreeNodeIndex, 2>> d_p2pPairs(numP2PPairs * 2);
+    DeviceVector<util::array<TreeNodeIndex, 2>> d_m2lPairs(numM2LPairs * 2);
 
     unsigned* d_p2pCount;
     unsigned* d_m2lCount;
@@ -139,14 +133,48 @@ void dualTraversalAllPairsGpu()
     cudaMemset(d_p2pCount, 0, sizeof(unsigned));
     cudaMemset(d_m2lCount, 0, sizeof(unsigned));
 
+    // Global work buffer
+    constexpr unsigned gChunk = DefaultTravConfig::chunkSize;
+    constexpr unsigned gSegs  = 256;
+    constexpr unsigned gCap   = gSegs * gChunk;
+    TreeNodeIndex* d_gA; cudaMalloc(&d_gA, gCap * sizeof(TreeNodeIndex));
+    TreeNodeIndex* d_gB; cudaMalloc(&d_gB, gCap * sizeof(TreeNodeIndex));
+    int* d_gIsP2P;       cudaMalloc(&d_gIsP2P, gCap * sizeof(int));
+    unsigned* d_wHead;   cudaMalloc(&d_wHead, sizeof(unsigned));
+    unsigned* d_rHead;   cudaMalloc(&d_rHead, sizeof(unsigned));
+    unsigned* d_segCount; cudaMalloc(&d_segCount, gSegs * sizeof(unsigned));
+    unsigned* d_segR;    cudaMalloc(&d_segR, gSegs * sizeof(unsigned));
+    unsigned* d_nProd;   cudaMalloc(&d_nProd, sizeof(unsigned));
+    cudaMemset(d_wHead, 0, sizeof(unsigned));
+    cudaMemset(d_rHead, 0, sizeof(unsigned));
+    cudaMemset(d_segCount, 0, gSegs * sizeof(unsigned));
+    cudaMemset(d_segR, 0, gSegs * sizeof(unsigned));
+    unsigned maxBlocks = maxConcurrentBlocks(
+        dualTraversalCount<TravConfig::numWarps>,
+        TravConfig::numThreadsPerBlock, TravConfig::kBlocksPerCluster);
+    unsigned totalBlocks = std::min(TravConfig::kTotalBlocks, maxBlocks);
+    unsigned producerWarpsTotal = totalBlocks * 2u;
+    cudaMemcpy(d_nProd, &producerWarpsTotal, sizeof(unsigned), cudaMemcpyHostToDevice);
+    GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wHead, d_rHead, d_segCount, d_segR, gSegs};
 
-    // cuda launch configuration
-    dim3 block(TravConfig::numThreadsPerBlock, 1, 1);
-    dim3 grid(TravConfig::kTotalBlocks, 1, 1);
+    // Global traversal work buffer
+    constexpr unsigned tChunk = DefaultTravConfig::travChunkSize;
+    constexpr unsigned tSegs  = 256;
+    constexpr unsigned tCap   = tSegs * tChunk;
+    TreeNodeIndex* d_tA; cudaMalloc(&d_tA, tCap * sizeof(TreeNodeIndex));
+    TreeNodeIndex* d_tB; cudaMalloc(&d_tB, tCap * sizeof(TreeNodeIndex));
+    unsigned* d_twHead;  cudaMalloc(&d_twHead, sizeof(unsigned));
+    unsigned* d_trHead;  cudaMalloc(&d_trHead, sizeof(unsigned));
+    unsigned* d_tsegR;   cudaMalloc(&d_tsegR, tSegs * sizeof(unsigned));
+    cudaMemset(d_twHead, 0, sizeof(unsigned));
+    cudaMemset(d_trHead, 0, sizeof(unsigned));
+    cudaMemset(d_tsegR, 0, tSegs * sizeof(unsigned));
+    GlobalTraversalQueue tq{d_tA, d_tB, d_twHead, d_trHead, d_tsegR, tSegs};
 
+    // Cluster launch configuration
     cudaLaunchConfig_t cfg{};
-    cfg.gridDim   = grid;
-    cfg.blockDim  = block;
+    cfg.gridDim   = {totalBlocks, 1, 1};
+    cfg.blockDim  = {TravConfig::numThreadsPerBlock, 1, 1};
 
     cudaLaunchAttribute attr{};
     attr.id = cudaLaunchAttributeClusterDimension;
@@ -157,8 +185,8 @@ void dualTraversalAllPairsGpu()
     cfg.attrs    = &attr;
     cfg.numAttrs = 1;
 
-    cudaLaunchKernelEx(&cfg, dualTraversalCount<TravConfig::numConsumersPerBlock>,
-                       rawPtr(gpuTree.childOffsets), 0, 0, rawPtr(d_p2pPairs), rawPtr(d_m2lPairs), d_p2pCount, d_m2lCount);
+    cudaLaunchKernelEx(&cfg, dualTraversalCount<TravConfig::numWarps>,
+                       rawPtr(gpuTree.childOffsets), 0, 0, rawPtr(d_p2pPairs), rawPtr(d_m2lPairs), d_p2pCount, d_m2lCount, gq, tq, d_nProd);
 
     cudaDeviceSynchronize();
 
@@ -183,8 +211,8 @@ void dualTraversalAllPairsGpu()
     std::sort(h_m2lPairs.begin(), h_m2lPairs.end());
     h_m2lPairs.erase(std::unique(h_m2lPairs.begin(), h_m2lPairs.end()), h_m2lPairs.end());
 
-    printf("Expected P2P Pairs: %d, GPU Computed P2P Pairs: %d \n", cpup2pPairs.size(), h_p2pPairs.size());
-    printf("Expected M2L Pairs: %d, GPU Computed M2L Pairs: %d \n", cpum2lPairs.size(), h_m2lPairs.size());
+    printf("Expected P2P Pairs: %zu, GPU Computed P2P Pairs: %zu \n", cpup2pPairs.size(), h_p2pPairs.size());
+    printf("Expected M2L Pairs: %zu, GPU Computed M2L Pairs: %zu \n", cpum2lPairs.size(), h_m2lPairs.size());
 
     // Compare GPU results against CPU reference.
     EXPECT_EQ(h_p2pPairs.size(), cpup2pPairs.size());
@@ -202,11 +230,24 @@ void dualTraversalAllPairsGpu()
 
     cudaFree(d_p2pCount);
     cudaFree(d_m2lCount);
+    cudaFree(d_gA);
+    cudaFree(d_gB);
+    cudaFree(d_gIsP2P);
+    cudaFree(d_wHead);
+    cudaFree(d_rHead);
+    cudaFree(d_segCount);
+    cudaFree(d_segR);
+    cudaFree(d_nProd);
+    cudaFree(d_tA);
+    cudaFree(d_tB);
+    cudaFree(d_twHead);
+    cudaFree(d_trHead);
+    cudaFree(d_tsegR);
 }
 
 TEST(Traversal, dualTraversalAllPairsGpu)
 {
-    // Run the GPU dual traversal for both 32‑bit and 64‑bit octree keys.
+    // Run the GPU dual traversal for both 32-bit and 64-bit octree keys.
     dualTraversalAllPairsGpu<unsigned>();
     dualTraversalAllPairsGpu<uint64_t>();
 }

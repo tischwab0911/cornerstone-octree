@@ -8,24 +8,25 @@
  */
 
 /*! @file
- * @brief Synthetic P2P benchmark: GPU dual traversal vs. single traversal (one thread per leaf)
+ * @brief Multipole benchmark: GPU dual traversal vs. single traversal with theta-MAC
  *
  * @author Timo Schwab <tischwab@ethz.ch>
  *
- * Builds a tree from random Gaussian coordinates and finds all pairs of leaf nodes
- * whose bounding boxes touch or overlap (minDistance == 0), simulating the interaction
- * list computation for direct particle-to-particle (P2P) interactions.
+ * Builds a tree from random Gaussian coordinates and evaluates a Barnes-Hut
+ * theta-based multipole acceptance criterion (MAC). When two nodes are
+ * sufficiently separated, an M2L interaction (simulated O(p^2) fmaf work) is
+ * applied and all descendants are skipped. When nodes are too close, they are
+ * refined until leaf-leaf P2P interactions (simulated O(n^2) fmaf work) remain.
+ *
+ * This demonstrates the core FMM advantage of dual traversal: early termination
+ * of far-field node pairs via a single M2L, whereas single traversal must
+ * independently discover this for every leaf.
  *
  * Two GPU methods are compared:
- *   1. Single: one GPU thread per leaf node calls singleTraversal to find all
- *              touching partner leaves (mirrors the findHalosGpu pattern).
- *   2. Dual:   cluster-based dualTraversalGPU (parallel, with DSM work-stealing).
- *
- * The p2p action spins over a (particlesPerBin x particlesPerBin) fmaf loop to
- * simulate the actual per-particle work inside a leaf-leaf interaction.
- *
- * Benchmark protocol: 20 warmup runs (discarded), then 100 timed runs.
- * Reports median, mean, stddev, min, max for each method.
+ *   1. Single: one GPU thread per leaf node calls singleTraversal. M2L work is
+ *              done inside the criterion lambda (before returning false) since
+ *              singleTraversal has no rejection callback.
+ *   2. Dual:   cluster-based dualTraversalGPU with non-empty M2L and P2P.
  */
 
 #include <vector>
@@ -50,21 +51,24 @@
 namespace cstone
 {
 
-using DefaultTravConfig = TraversalConfig<1024, 224, 704, 512, 160, 96, 192, 640, 224, 32>;
+using MultipoleTravConfig = TraversalConfig<1024, 224, 704, 512, 160, 96, 192, 640, 224, 32>;
 
 // ── Single traversal GPU kernel ───────────────────────────────────────────────
 
 template<class T>
-__global__ void singleTraversalP2PKernel(
+__global__ void singleTraversalMultipoleKernel(
     const TreeNodeIndex* __restrict__ childOffsets,
     const TreeNodeIndex* __restrict__ parents,
     const TreeNodeIndex* __restrict__ leafToInternal,
     const Vec3<T>* __restrict__       nodeCenters,
     const Vec3<T>* __restrict__       nodeSizes,
     Box<T>                            box,
+    T                                 invTheta,
     unsigned                          numLeaves,
     unsigned                          particlesPerBin,
-    unsigned*                         p2pCount)
+    unsigned                          multipoleOrder,
+    unsigned*                         p2pCount,
+    unsigned*                         m2lCount)
 {
     unsigned leafIdx = blockIdx.x * blockDim.x + threadIdx.x;
     if (leafIdx >= numLeaves) { return; }
@@ -73,11 +77,43 @@ __global__ void singleTraversalP2PKernel(
     Vec3<T>  centerA  = nodeCenters[a];
     Vec3<T>  sizeA    = nodeSizes[a];
 
-    auto criterion = [centerA, sizeA, nodeCenters, nodeSizes, box]
+    // Criterion: returns true to continue descending, false to reject (M2L applied inline).
+    // singleTraversal has no rejection callback, so M2L work must be done here before returning false.
+    auto criterion = [a, centerA, sizeA, nodeCenters, nodeSizes, box, invTheta,
+                      childOffsets, multipoleOrder, m2lCount]
         (TreeNodeIndex b) -> bool
     {
-        Vec3<T> d = minDistance(centerA, sizeA, nodeCenters[b], nodeSizes[b], box);
-        return norm2(d) == T(0);
+        Vec3<T> cB = nodeCenters[b];
+        Vec3<T> sB = nodeSizes[b];
+
+        Vec3<T> d = minDistance(centerA, sizeA, cB, sB, box);
+        T dist2   = norm2(d);
+
+        // l_max = max side length of either node (size stores half-sizes)
+        T lA = T(2) * max(max(sizeA[0], sizeA[1]), sizeA[2]);
+        T lB = T(2) * max(max(sB[0], sB[1]), sB[2]);
+        T lMax = max(lA, lB);
+
+        T threshold = lMax * invTheta;
+        T threshold2 = threshold * threshold;
+
+        if (dist2 < threshold2)
+        {
+            // Too close — continue refining
+            return true;
+        }
+
+        // Far enough — apply M2L work inline before returning false
+        // Only for internal nodes (leaves will be handled by endpoint action if they pass criterion)
+        if (childOffsets[b] != 0)
+        {
+            volatile float acc = 0.f;
+            for (unsigned pi = 0; pi < multipoleOrder; ++pi)
+                for (unsigned pj = 0; pj < multipoleOrder; ++pj)
+                    acc = __fmaf_rn(float(a + pi), float(b + pj), acc);
+            atomicAdd(m2lCount, 1u);
+        }
+        return false;
     };
 
     auto action = [p2pCount, a, particlesPerBin] (TreeNodeIndex b)
@@ -95,26 +131,49 @@ __global__ void singleTraversalP2PKernel(
 // ── Dual traversal GPU kernel ─────────────────────────────────────────────────
 
 template<int numWarps, class T>
-__global__ void dualP2PKernel(
+__global__ void dualMultipoleKernel(
     const TreeNodeIndex* __restrict__ childOffsets,
     const Vec3<T>* __restrict__       nodeCenters,
     const Vec3<T>* __restrict__       nodeSizes,
     Box<T>                            box,
+    T                                 invTheta,
     TreeNodeIndex                     rootA,
     TreeNodeIndex                     rootB,
     unsigned                          particlesPerBin,
+    unsigned                          multipoleOrder,
     unsigned*                         p2pCount,
+    unsigned*                         m2lCount,
     GlobalWorkQueue                   globalQueue,
     GlobalTraversalQueue              globalTraversalQueue,
     unsigned*                         numActiveProducers)
 {
-    auto criterion = [nodeCenters, nodeSizes, box] __device__(TreeNodeIndex a, TreeNodeIndex b) -> bool
+    auto criterion = [nodeCenters, nodeSizes, box, invTheta]
+        __device__(TreeNodeIndex a, TreeNodeIndex b) -> bool
     {
-        Vec3<T> d = minDistance(nodeCenters[a], nodeSizes[a], nodeCenters[b], nodeSizes[b], box);
-        return norm2(d) == T(0);
+        Vec3<T> cA = nodeCenters[a];
+        Vec3<T> sA = nodeSizes[a];
+        Vec3<T> cB = nodeCenters[b];
+        Vec3<T> sB = nodeSizes[b];
+
+        Vec3<T> d = minDistance(cA, sA, cB, sB, box);
+        T dist2   = norm2(d);
+
+        T lA = T(2) * max(max(sA[0], sA[1]), sA[2]);
+        T lB = T(2) * max(max(sB[0], sB[1]), sB[2]);
+        T lMax = max(lA, lB);
+
+        T threshold = lMax * invTheta;
+        return dist2 < threshold * threshold;
     };
 
-    auto m2l = [] __device__(TreeNodeIndex, TreeNodeIndex) {};
+    auto m2l = [m2lCount, multipoleOrder] __device__(TreeNodeIndex a, TreeNodeIndex b)
+    {
+        volatile float acc = 0.f;
+        for (unsigned pi = 0; pi < multipoleOrder; ++pi)
+            for (unsigned pj = 0; pj < multipoleOrder; ++pj)
+                acc = __fmaf_rn(float(a + pi), float(b + pj), acc);
+        atomicAdd(m2lCount, 1u);
+    };
 
     auto p2p = [p2pCount, particlesPerBin] __device__(TreeNodeIndex a, TreeNodeIndex b)
     {
@@ -125,7 +184,7 @@ __global__ void dualP2PKernel(
         atomicAdd(p2pCount, 1u);
     };
 
-    dualTraversalGPU<numWarps, DefaultTravConfig>(
+    dualTraversalGPU<numWarps, MultipoleTravConfig>(
         childOffsets, rootA, rootB,
         globalQueue, globalTraversalQueue, numActiveProducers,
         criterion, m2l, p2p);
@@ -142,14 +201,12 @@ struct DualConfig
 {
     static constexpr unsigned numWarps = 7;
     static constexpr unsigned numThreadsPerBlock = numWarps * GpuConfig::warpSize;
-    // static_assert(numThreadsPerBlock >= 64 && numThreadsPerBlock <= 512);
 
     static constexpr unsigned kBlocksPerCluster = 8;
     static constexpr unsigned kNumClusters      = 64;
     static constexpr unsigned kTotalBlocks      = kBlocksPerCluster * kNumClusters;
 
-    //! @brief per-block shared memory capacity (derived from TraversalConfig)
-    static constexpr unsigned stackCap = DefaultTravConfig::stackCap;
+    static constexpr unsigned stackCap = MultipoleTravConfig::stackCap;
 };
 
 // ── Statistics helpers ────────────────────────────────────────────────────────
@@ -163,7 +220,7 @@ struct BenchStats
     float maxVal;
 };
 
-BenchStats computeStats(std::vector<float>& samples)
+inline BenchStats computeStats(std::vector<float>& samples)
 {
     std::sort(samples.begin(), samples.end());
 
@@ -183,7 +240,7 @@ BenchStats computeStats(std::vector<float>& samples)
     return {med, avg, sd, samples.front(), samples.back()};
 }
 
-void printStats(const char* label, const BenchStats& s)
+inline void printStats(const char* label, const BenchStats& s)
 {
     printf("  %-22s  median=%.3f  mean=%.3f  stddev=%.3f  min=%.3f  max=%.3f ms\n",
            label, s.median, s.mean, s.stddev, s.minVal, s.maxVal);
@@ -191,10 +248,13 @@ void printStats(const char* label, const BenchStats& s)
 
 // ── Benchmark body ────────────────────────────────────────────────────────────
 
-void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
-                            unsigned particlesPerBin = 32,
-                            unsigned numWarmup       = 10,
-                            unsigned numRuns         = 50)
+void multipoleBenchmark(unsigned numParticles    = 2000000,
+                        unsigned particlesPerBin = 32,
+                        unsigned multipoleOrder  = 4,
+                        double   theta           = 0.5,
+                        unsigned bucketSize      = 16,
+                        unsigned numWarmup       = 10,
+                        unsigned numRuns         = 50)
 {
     using KeyType = uint64_t;
     using T       = double;
@@ -208,7 +268,7 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
     std::vector<KeyType>  leaves{0, nodeRange<KeyType>(0)};
     std::vector<unsigned> counts{numParticles};
     while (!updateOctree(std::span<const KeyType>(particleKeys.data(), numParticles),
-                         particlesPerBin, leaves, counts))
+                         bucketSize, leaves, counts))
         ;
 
     Octree<KeyType> octree;
@@ -217,9 +277,14 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
     const TreeNodeIndex numTreeNodes = octree.numTreeNodes();
     const unsigned      numLeaves    = nNodes(leaves);
 
-    printf("Synthetic P2P benchmark\n");
-    printf("  particles=%u  leaves=%u  nodes=%d  bin=%u\n",
-           numParticles, numLeaves, numTreeNodes, particlesPerBin);
+    T invTheta = T(1) / T(theta);
+
+    printf("Multipole benchmark (theta=%.2f, p=%u, ppb=%u)\n", theta, multipoleOrder, particlesPerBin);
+    printf("  particles=%u  leaves=%u  nodes=%d  bucket=%u\n",
+           numParticles, numLeaves, numTreeNodes, bucketSize);
+    printf("  P2P cost=%u  M2L cost=%u  ratio=%u:1\n",
+           particlesPerBin * particlesPerBin, multipoleOrder * multipoleOrder,
+           (particlesPerBin * particlesPerBin) / (multipoleOrder * multipoleOrder));
     printf("  warmup=%u  runs=%u\n\n", numWarmup, numRuns);
 
     // ── Per-node geometry (centers and half-sizes) ────────────────────────────
@@ -249,8 +314,10 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
     DeviceVector<Vec3<T>>       d_nodeCenters(h_nodeCenters);
     DeviceVector<Vec3<T>>       d_nodeSizes(h_nodeSizes);
 
-    unsigned* d_count;
-    cudaMalloc(&d_count, sizeof(unsigned));
+    unsigned* d_p2pCount;
+    unsigned* d_m2lCount;
+    cudaMalloc(&d_p2pCount, sizeof(unsigned));
+    cudaMalloc(&d_m2lCount, sizeof(unsigned));
 
     // ── Single traversal lambda ──────────────────────────────────────────────
     const unsigned singleBlocks =
@@ -258,8 +325,9 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
 
     auto runSingle = [&]()
     {
-        cudaMemset(d_count, 0, sizeof(unsigned));
-        singleTraversalP2PKernel<T>
+        cudaMemset(d_p2pCount, 0, sizeof(unsigned));
+        cudaMemset(d_m2lCount, 0, sizeof(unsigned));
+        singleTraversalMultipoleKernel<T>
             <<<singleBlocks, SingleConfig::numThreadsPerBlock>>>(
                 rawPtr(d_childOffsets),
                 rawPtr(d_parents),
@@ -267,13 +335,16 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
                 rawPtr(d_nodeCenters),
                 rawPtr(d_nodeSizes),
                 box,
+                invTheta,
                 numLeaves,
                 particlesPerBin,
-                d_count);
+                multipoleOrder,
+                d_p2pCount,
+                d_m2lCount);
     };
 
     // ── Global work buffer ──
-    constexpr unsigned gChunk = DefaultTravConfig::chunkSize;
+    constexpr unsigned gChunk = MultipoleTravConfig::chunkSize;
     constexpr unsigned gSegs  = 2048;
     constexpr unsigned gCap   = gSegs * gChunk;
     TreeNodeIndex* d_gA; cudaMalloc(&d_gA, gCap * sizeof(TreeNodeIndex));
@@ -287,7 +358,7 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
     GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wHead, d_rHead, d_segCount, d_segR, gSegs};
 
     // Global traversal queue
-    constexpr unsigned tChunk = DefaultTravConfig::travChunkSize;
+    constexpr unsigned tChunk = MultipoleTravConfig::travChunkSize;
     constexpr unsigned tSegs  = 2048;
     constexpr unsigned tCap   = tSegs * tChunk;
     TreeNodeIndex* d_tA;  cudaMalloc(&d_tA, tCap * sizeof(TreeNodeIndex));
@@ -297,12 +368,7 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
     unsigned* d_tsegR;    cudaMalloc(&d_tsegR, tSegs * sizeof(unsigned));
     GlobalTraversalQueue tq{d_tA, d_tB, d_twHead, d_trHead, d_tsegR, tSegs};
 
-    // unsigned maxBlocks = maxConcurrentBlocks(
-    //     dualP2PKernel<DualConfig::numWarps, T>,
-    //     DualConfig::numThreadsPerBlock, DualConfig::kBlocksPerCluster);
-    // unsigned dualTotalBlocks = std::min(DualConfig::kTotalBlocks, maxBlocks);
     unsigned dualTotalBlocks = DualConfig::kTotalBlocks;
-    // printf("Max concurrent blocks for dual traversal: %u (configured %u)\n", maxBlocks, DualConfig::kTotalBlocks);
 
     // ── Dual traversal lambda ────────────────────────────────────────────────
     cudaLaunchConfig_t dualCfg{};
@@ -319,7 +385,8 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
 
     auto runDual = [&]()
     {
-        cudaMemset(d_count, 0, sizeof(unsigned));
+        cudaMemset(d_p2pCount, 0, sizeof(unsigned));
+        cudaMemset(d_m2lCount, 0, sizeof(unsigned));
         cudaMemset(d_wHead, 0, sizeof(unsigned));
         cudaMemset(d_rHead, 0, sizeof(unsigned));
         cudaMemset(d_segCount, 0, gSegs * sizeof(unsigned));
@@ -330,15 +397,18 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
         unsigned producerWarpsTotal = dualTotalBlocks * 2u;
         cudaMemcpy(d_nProd, &producerWarpsTotal, sizeof(unsigned), cudaMemcpyHostToDevice);
         cudaLaunchKernelEx(&dualCfg,
-                           dualP2PKernel<DualConfig::numWarps, T>,
+                           dualMultipoleKernel<DualConfig::numWarps, T>,
                            rawPtr(d_childOffsets),
                            rawPtr(d_nodeCenters),
                            rawPtr(d_nodeSizes),
                            box,
+                           invTheta,
                            TreeNodeIndex{0},
                            TreeNodeIndex{0},
                            particlesPerBin,
-                           d_count,
+                           multipoleOrder,
+                           d_p2pCount,
+                           d_m2lCount,
                            gq,
                            tq,
                            d_nProd);
@@ -347,20 +417,27 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
     // ── Correctness check (one run of each) ──────────────────────────────────
     runSingle();
     cudaDeviceSynchronize();
-    unsigned h_singleCount = 0;
-    cudaMemcpy(&h_singleCount, d_count, sizeof(unsigned), cudaMemcpyDeviceToHost);
+    unsigned h_singleP2P = 0, h_singleM2L = 0;
+    cudaMemcpy(&h_singleP2P, d_p2pCount, sizeof(unsigned), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_singleM2L, d_m2lCount, sizeof(unsigned), cudaMemcpyDeviceToHost);
 
     runDual();
     cudaDeviceSynchronize();
-    unsigned h_dualCount = 0;
-    cudaMemcpy(&h_dualCount, d_count, sizeof(unsigned), cudaMemcpyDeviceToHost);
+    unsigned h_dualP2P = 0, h_dualM2L = 0;
+    cudaMemcpy(&h_dualP2P, d_p2pCount, sizeof(unsigned), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_dualM2L, d_m2lCount, sizeof(unsigned), cudaMemcpyDeviceToHost);
 
-    printf("  p2p pairs: single=%u  dual=%u\n\n", h_singleCount, h_dualCount);
+    printf("  P2P pairs:  single=%u  dual=%u\n", h_singleP2P, h_dualP2P);
+    printf("  M2L pairs:  single=%u  dual=%u\n", h_singleM2L, h_dualM2L);
+    if (h_dualM2L > 0)
+        printf("  M2L reduction ratio: %.1fx (single/dual)\n\n", (float)h_singleM2L / (float)h_dualM2L);
+    else
+        printf("  M2L reduction ratio: N/A (dual M2L count is 0)\n\n");
 
     // ── Warmup ───────────────────────────────────────────────────────────────
     printf("  Warming up (%u runs each)...\n", numWarmup);
-    for (unsigned i = 0; i < numWarmup; ++i) { timeGpu(runSingle); printf("%d\n",i);}
-    for (unsigned i = 0; i < numWarmup; ++i) { timeGpu(runDual); printf("%d\n",i);}
+    for (unsigned i = 0; i < numWarmup; ++i) { timeGpu(runSingle); }
+    for (unsigned i = 0; i < numWarmup; ++i) { timeGpu(runDual); }
 
     // ── Timed runs ───────────────────────────────────────────────────────────
     printf("  Timing (%u runs each)...\n\n", numRuns);
@@ -369,7 +446,7 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
     std::vector<float> dualTimes(numRuns);
 
     for (unsigned i = 0; i < numRuns; ++i) { singleTimes[i] = timeGpu(runSingle); }
-    for (unsigned i = 0; i < numRuns; ++i) { dualTimes[i]   = timeGpu(runDual); printf("%d\n",i);}
+    for (unsigned i = 0; i < numRuns; ++i) { dualTimes[i]   = timeGpu(runDual); }
 
     // ── Report ───────────────────────────────────────────────────────────────
     BenchStats singleStats = computeStats(singleTimes);
@@ -381,7 +458,9 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
     printf("\n  Speedup (median): %.2fx\n", singleStats.median / dualStats.median);
     printf("  Speedup (mean):   %.2fx\n",   singleStats.mean / dualStats.mean);
 
-    cudaFree(d_count);
+    // ── Cleanup ──────────────────────────────────────────────────────────────
+    cudaFree(d_p2pCount);
+    cudaFree(d_m2lCount);
     cudaFree(d_gA);
     cudaFree(d_gB);
     cudaFree(d_gIsP2P);
@@ -397,9 +476,9 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
     cudaFree(d_tsegR);
 }
 
-TEST(Traversal, syntheticP2PBenchmark)
+TEST(Traversal, multipoleBenchmark)
 {
-    syntheticP2PBenchmark(5000000, 16, 10, 50);
+    multipoleBenchmark(2000000, 32, 4, 0.5, 16, 10, 50);
 }
 
 } // namespace cstone

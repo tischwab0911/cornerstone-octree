@@ -42,16 +42,10 @@
 namespace cstone
 {
 
-/*! @brief GPU dual-traversal kernel for halo detection
- *
- * For each pair of leaf nodes (a, b) where a is local and b is external and
- * their geometric bounding boxes overlap, marks collisionFlags[b] = 1.
- *
- * @tparam numConsumersPerBlock  number of consumer warps per block
- * @tparam KeyType               32- or 64-bit unsigned SFC key type
- * @tparam T                     float or double (coordinate type)
- */
-template <int numConsumersPerBlock, class KeyType, class T>
+using HaloTravConfig = TraversalConfig<1024>;
+
+/*! @brief GPU dual-traversal kernel for halo detection */
+template <int numWarps, class KeyType, class T>
 __global__ void dualTraversalHalosKernel(
     const TreeNodeIndex* __restrict__ childOffsets,
     const KeyType*       __restrict__ codeStarts,
@@ -64,7 +58,10 @@ __global__ void dualTraversalHalosKernel(
     Box<T> box,
     TreeNodeIndex rootA,
     TreeNodeIndex rootB,
-    uint8_t* __restrict__ collisionFlags)
+    uint8_t* __restrict__ collisionFlags,
+    GlobalWorkQueue globalQueue,
+    GlobalTraversalQueue globalTraversalQueue,
+    unsigned* __restrict__ numActiveProducers)
 {
     //! criterion: a overlaps local range, b not fully local, a's inflated box overlaps b's box
     auto criterion =
@@ -85,29 +82,31 @@ __global__ void dualTraversalHalosKernel(
         collisionFlags[b] = 1;
     };
 
-    dualTraversalGPU<numConsumersPerBlock>(childOffsets, rootA, rootB, criterion, m2l, p2p);
+    dualTraversalGPU<numWarps, HaloTravConfig>(
+        childOffsets, rootA, rootB,
+        globalQueue, globalTraversalQueue, numActiveProducers,
+        criterion, m2l, p2p);
 }
 
 struct DualHaloConfig
 {
-    //! @brief number of consumer warps per block (all warps except warp 0 are consumers)
-    static constexpr unsigned numConsumersPerBlock = 8;
+    static constexpr unsigned numWarps = 4;
 
-    /*! @brief number of threads per block
-     *  must be at least 64 and at most 512, and a multiple of warpSize
-     */
-    static constexpr unsigned numThreadsPerBlock = (numConsumersPerBlock + 1) * GpuConfig::warpSize;
-    static_assert(numThreadsPerBlock >= 64 && numThreadsPerBlock <= 512);
+    static constexpr unsigned numThreadsPerBlock = numWarps * GpuConfig::warpSize;
+    // static_assert(numThreadsPerBlock >= 64 && numThreadsPerBlock <= 512);
 
-    //! @brief number of blocks per thread block cluster, must be a power of 8
+    //! @brief number of blocks per thread block cluster
     static constexpr unsigned kBlocksPerCluster = 8;
 
-    //! @brief number of clusters in the grid, must be a power of 8
-    static constexpr unsigned kNumClusters = 8*8;
+    //! @brief number of clusters in the grid
+    static constexpr unsigned kNumClusters = 64;
 
     //! @brief total number of blocks launched
     static constexpr unsigned kTotalBlocks = kBlocksPerCluster * kNumClusters;
     static_assert(kBlocksPerCluster > 0 && kNumClusters > 0);
+
+    //! @brief per-block shared memory capacity (node-pair slots)
+    static constexpr unsigned stackCap = HaloTravConfig::stackCap;
 };
 
 void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize = 16)
@@ -162,10 +161,6 @@ void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize =
         h_nodeSizes[i]    = s;
     }
 
-    // ── Search centers: inflate by factor 2 to simulate a halo radius ──
-    // Without inflation, overlap() with eps=0 returns false for touching-but-disjoint
-    // octree cells (dX == 0, not < 0), so zero halos would be detected.
-    // A factor of 2 makes touching cells flag: dX = sizeA*(1-2) = -sizeA < 0.
     constexpr T haloFactor = 2;
     std::vector<Vec3<T>> h_searchCenters(numLeaves);
     std::vector<Vec3<T>> h_searchSizes(numLeaves);
@@ -234,12 +229,43 @@ void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize =
     uint8_t* d_dualFlags = nullptr;
     cudaMalloc(&d_dualFlags, numTreeNodes * sizeof(uint8_t));
 
-    dim3 dualBlock(DualHaloConfig::numThreadsPerBlock, 1, 1);
-    dim3 dualGrid(DualHaloConfig::kTotalBlocks, 1, 1);
+    // ── Allocate global work buffer ──
+    constexpr unsigned gChunkSize   = HaloTravConfig::chunkSize;
+    constexpr unsigned gNumSegments = 1024;
+    constexpr unsigned gCapacity    = gNumSegments * gChunkSize;
+
+    TreeNodeIndex* d_gNodeA;  cudaMalloc(&d_gNodeA, gCapacity * sizeof(TreeNodeIndex));
+    TreeNodeIndex* d_gNodeB;  cudaMalloc(&d_gNodeB, gCapacity * sizeof(TreeNodeIndex));
+    int*           d_gIsP2P;  cudaMalloc(&d_gIsP2P, gCapacity * sizeof(int));
+    unsigned*      d_writeHead;  cudaMalloc(&d_writeHead, sizeof(unsigned));
+    unsigned*      d_readHead;   cudaMalloc(&d_readHead, sizeof(unsigned));
+    unsigned*      d_segCount;   cudaMalloc(&d_segCount, gNumSegments * sizeof(unsigned));
+    unsigned*      d_segReady;   cudaMalloc(&d_segReady, gNumSegments * sizeof(unsigned));
+    unsigned*      d_numProducers; cudaMalloc(&d_numProducers, sizeof(unsigned));
+
+    GlobalWorkQueue gq{d_gNodeA, d_gNodeB, d_gIsP2P, d_writeHead, d_readHead, d_segCount, d_segReady, gNumSegments};
+
+    // Global traversal work buffer
+    constexpr unsigned tChunkSize   = HaloTravConfig::travChunkSize;
+    constexpr unsigned tNumSegments = 1024;
+    constexpr unsigned tCapacity    = tNumSegments * tChunkSize;
+
+    TreeNodeIndex* d_tNodeA;  cudaMalloc(&d_tNodeA, tCapacity * sizeof(TreeNodeIndex));
+    TreeNodeIndex* d_tNodeB;  cudaMalloc(&d_tNodeB, tCapacity * sizeof(TreeNodeIndex));
+    unsigned*      d_tWriteHead;  cudaMalloc(&d_tWriteHead, sizeof(unsigned));
+    unsigned*      d_tReadHead;   cudaMalloc(&d_tReadHead, sizeof(unsigned));
+    unsigned*      d_tSegReady;   cudaMalloc(&d_tSegReady, tNumSegments * sizeof(unsigned));
+
+    GlobalTraversalQueue tq{d_tNodeA, d_tNodeB, d_tWriteHead, d_tReadHead, d_tSegReady, tNumSegments};
+
+    unsigned maxBlocks = maxConcurrentBlocks(
+        dualTraversalHalosKernel<DualHaloConfig::numWarps, KeyType, T>,
+        DualHaloConfig::numThreadsPerBlock, DualHaloConfig::kBlocksPerCluster);
+    unsigned totalBlocks = std::min(DualHaloConfig::kTotalBlocks, maxBlocks);
 
     cudaLaunchConfig_t dualCfg{};
-    dualCfg.gridDim  = dualGrid;
-    dualCfg.blockDim = dualBlock;
+    dualCfg.gridDim  = {totalBlocks, 1, 1};
+    dualCfg.blockDim = {DualHaloConfig::numThreadsPerBlock, 1, 1};
 
     cudaLaunchAttribute dualAttr{};
     dualAttr.id               = cudaLaunchAttributeClusterDimension;
@@ -253,8 +279,18 @@ void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize =
     auto runDualTraversal = [&]()
     {
         cudaMemset(d_dualFlags, 0, numTreeNodes * sizeof(uint8_t));
+        cudaMemset(d_writeHead, 0, sizeof(unsigned));
+        cudaMemset(d_readHead, 0, sizeof(unsigned));
+        cudaMemset(d_segCount, 0, gNumSegments * sizeof(unsigned));
+        cudaMemset(d_segReady, 0, gNumSegments * sizeof(unsigned));
+        cudaMemset(d_tWriteHead, 0, sizeof(unsigned));
+        cudaMemset(d_tReadHead, 0, sizeof(unsigned));
+        cudaMemset(d_tSegReady, 0, tNumSegments * sizeof(unsigned));
+        unsigned producerWarpsTotal = totalBlocks * 2u;
+        cudaMemcpy(d_numProducers, &producerWarpsTotal, sizeof(unsigned), cudaMemcpyHostToDevice);
+
         cudaLaunchKernelEx(&dualCfg,
-                           dualTraversalHalosKernel<DualHaloConfig::numConsumersPerBlock, KeyType, T>,
+                           dualTraversalHalosKernel<DualHaloConfig::numWarps, KeyType, T>,
                            rawPtr(gpuTree.childOffsets),
                            rawPtr(d_codeStarts),
                            rawPtr(d_codeEnds),
@@ -266,7 +302,10 @@ void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize =
                            box,
                            TreeNodeIndex{0},
                            TreeNodeIndex{0},
-                           d_dualFlags);
+                           d_dualFlags,
+                           gq,
+                           tq,
+                           d_numProducers);
     };
 
     float dualTime = timeGpu(runDualTraversal);
@@ -281,8 +320,6 @@ void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize =
     cudaMemcpy(h_dualFlags.data(), d_dualFlags, numTreeNodes * sizeof(uint8_t), cudaMemcpyDeviceToHost);
 
     // ── Validate CPU vs GPU reference at leaf level ───────────────
-    // Both findHalos and findHalosGpu mark all tree nodes (internal + leaf).
-    // Compare at leaf level (childOffsets[i] == 0) for nodes outside local range.
     size_t cpuGpuMismatches = 0;
     for (TreeNodeIndex i = 0; i < numTreeNodes; ++i)
     {
@@ -300,14 +337,10 @@ void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize =
         << "CPU findHalos vs GPU findHalosGpu leaf mismatches: " << cpuGpuMismatches;
 
     // ── Validate dual traversal vs CPU reference at leaf level ────
-    // The dual traversal marks only leaf nodes (p2p action).
-    // The CPU reference also marks leaf nodes (criterion is true for leaves too).
-    // Compare: external leaf nodes only (not fully in local range).
     size_t dualMismatches = 0;
     for (TreeNodeIndex i = 0; i < numTreeNodes; ++i)
     {
         if (!octree.isLeaf(i)) { continue; }
-        // Skip local nodes — dual traversal may or may not mark them (both are OK)
         bool isLocal = containedIn(h_codeStarts[i], h_codeEnds[i], localStart, localEnd);
         if (isLocal) { continue; }
 
@@ -344,11 +377,29 @@ void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize =
     printf("Flagged external leaf nodes — CPU: %u, findHalosGpu: %u, dual: %u\n",
            cpuFlaggedLeaves, gpuFlaggedLeaves, dualFlaggedLeaves);
 
-    // Ensure the test is non-trivial: with haloFactor > 1, boundary leaves must be flagged
     EXPECT_GT(cpuFlaggedLeaves, 0u) << "No external leaves flagged — test is vacuous";
+
+    // ── Sanity check: global buffer was used ──
+    unsigned h_wHead = 0, h_rHead = 0;
+    cudaMemcpy(&h_wHead, d_writeHead, sizeof(unsigned), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_rHead, d_readHead, sizeof(unsigned), cudaMemcpyDeviceToHost);
+    printf("Global buffer: writeHead=%u, readHead=%u\n", h_wHead, h_rHead);
 
     cudaFree(d_gpuFlags);
     cudaFree(d_dualFlags);
+    cudaFree(d_gNodeA);
+    cudaFree(d_gNodeB);
+    cudaFree(d_gIsP2P);
+    cudaFree(d_writeHead);
+    cudaFree(d_readHead);
+    cudaFree(d_segCount);
+    cudaFree(d_segReady);
+    cudaFree(d_numProducers);
+    cudaFree(d_tNodeA);
+    cudaFree(d_tNodeB);
+    cudaFree(d_tWriteHead);
+    cudaFree(d_tReadHead);
+    cudaFree(d_tSegReady);
 }
 
 TEST(Traversal, haloDetectionGpu)
