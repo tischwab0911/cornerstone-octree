@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/coordinate_test.dir/link.d CMakeFiles/coordinate_test.dir/random.cpp.o CMakeFiles/coordinate_test.dir/test_main.cpp.o -o coordinate_test  ../../lib/libgtest_main.a ../../lib/libgtest.a

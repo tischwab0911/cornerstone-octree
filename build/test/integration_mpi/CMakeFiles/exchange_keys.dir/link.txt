@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/exchange_keys.dir/link.d CMakeFiles/exchange_keys.dir/exchange_keys.cpp.o CMakeFiles/exchange_keys.dir/test_main.cpp.o -o exchange_keys  ../../lib/libgtest_main.a ../../lib/libgtest.a

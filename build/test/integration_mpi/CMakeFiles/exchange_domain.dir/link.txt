@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/exchange_domain.dir/link.d CMakeFiles/exchange_domain.dir/exchange_domain.cpp.o CMakeFiles/exchange_domain.dir/test_main.cpp.o -o exchange_domain  ../../lib/libgtest_main.a ../../lib/libgtest.a

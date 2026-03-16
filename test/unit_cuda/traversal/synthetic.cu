@@ -284,7 +284,7 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
     unsigned* d_segCount; cudaMalloc(&d_segCount, gSegs * sizeof(unsigned));
     unsigned* d_segR;    cudaMalloc(&d_segR, gSegs * sizeof(unsigned));
     unsigned* d_nProd;   cudaMalloc(&d_nProd, sizeof(unsigned));
-    GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wHead, d_rHead, d_segCount, d_segR, gSegs};
+    GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wHead, d_rHead, d_segCount, d_segR, gSegs, gChunk};
 
     // Global traversal queue
     constexpr unsigned tChunk = DefaultTravConfig::travChunkSize;
@@ -295,7 +295,7 @@ void syntheticP2PBenchmark(unsigned numParticles    = 1000000,
     unsigned* d_twHead;   cudaMalloc(&d_twHead, sizeof(unsigned));
     unsigned* d_trHead;   cudaMalloc(&d_trHead, sizeof(unsigned));
     unsigned* d_tsegR;    cudaMalloc(&d_tsegR, tSegs * sizeof(unsigned));
-    GlobalTraversalQueue tq{d_tA, d_tB, d_twHead, d_trHead, d_tsegR, tSegs};
+    GlobalTraversalQueue tq{d_tA, d_tB, d_twHead, d_trHead, d_tsegR, tSegs, tChunk};
 
     // unsigned maxBlocks = maxConcurrentBlocks(
     //     dualP2PKernel<DualConfig::numWarps, T>,

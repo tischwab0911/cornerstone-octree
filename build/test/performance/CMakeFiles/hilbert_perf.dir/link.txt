@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG -fopenmp -Wl,--dependency-file=CMakeFiles/hilbert_perf.dir/link.d CMakeFiles/hilbert_perf.dir/hilbert.cpp.o -o hilbert_perf  /usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a

@@ -155,7 +155,7 @@ void dualTraversalAllPairsGpu()
     unsigned totalBlocks = std::min(TravConfig::kTotalBlocks, maxBlocks);
     unsigned producerWarpsTotal = totalBlocks * 2u;
     cudaMemcpy(d_nProd, &producerWarpsTotal, sizeof(unsigned), cudaMemcpyHostToDevice);
-    GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wHead, d_rHead, d_segCount, d_segR, gSegs};
+    GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wHead, d_rHead, d_segCount, d_segR, gSegs, gChunk};
 
     // Global traversal work buffer
     constexpr unsigned tChunk = DefaultTravConfig::travChunkSize;
@@ -169,7 +169,7 @@ void dualTraversalAllPairsGpu()
     cudaMemset(d_twHead, 0, sizeof(unsigned));
     cudaMemset(d_trHead, 0, sizeof(unsigned));
     cudaMemset(d_tsegR, 0, tSegs * sizeof(unsigned));
-    GlobalTraversalQueue tq{d_tA, d_tB, d_twHead, d_trHead, d_tsegR, tSegs};
+    GlobalTraversalQueue tq{d_tA, d_tB, d_twHead, d_trHead, d_tsegR, tSegs, tChunk};
 
     // Cluster launch configuration
     cudaLaunchConfig_t cfg{};
