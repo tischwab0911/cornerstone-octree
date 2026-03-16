@@ -243,7 +243,8 @@ void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize =
     unsigned*      d_segReady;   cudaMalloc(&d_segReady, gNumSegments * sizeof(unsigned));
     unsigned*      d_numProducers; cudaMalloc(&d_numProducers, sizeof(unsigned));
 
-    GlobalWorkQueue gq{d_gNodeA, d_gNodeB, d_gIsP2P, d_writeHead, d_readHead, d_segCount, d_segReady, gNumSegments};
+    GlobalWorkQueue gq{d_gNodeA, d_gNodeB, d_gIsP2P, d_writeHead, d_readHead, d_segCount, d_segReady,
+                       gNumSegments, gChunkSize};
 
     // Global traversal work buffer
     constexpr unsigned tChunkSize   = HaloTravConfig::travChunkSize;
@@ -256,7 +257,8 @@ void haloDetectionGpuTest(unsigned numParticles = 2000000, unsigned bucketSize =
     unsigned*      d_tReadHead;   cudaMalloc(&d_tReadHead, sizeof(unsigned));
     unsigned*      d_tSegReady;   cudaMalloc(&d_tSegReady, tNumSegments * sizeof(unsigned));
 
-    GlobalTraversalQueue tq{d_tNodeA, d_tNodeB, d_tWriteHead, d_tReadHead, d_tSegReady, tNumSegments};
+    GlobalTraversalQueue tq{d_tNodeA, d_tNodeB, d_tWriteHead, d_tReadHead, d_tSegReady,
+                            tNumSegments, tChunkSize};
 
     unsigned maxBlocks = maxConcurrentBlocks(
         dualTraversalHalosKernel<DualHaloConfig::numWarps, KeyType, T>,

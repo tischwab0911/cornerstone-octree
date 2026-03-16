@@ -19,6 +19,7 @@
 #include "cstone/tree/octree.hpp"
 #include "cstone/cuda/gpu_config.cuh"
 #include "cstone/primitives/warpscan.cuh"
+#include "cstone/traversal/queue_gpu.cuh"
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -79,6 +80,8 @@ namespace cstone
 {
 
 constexpr unsigned kProducerWarpsPerBlock = 2;
+using GlobalWorkQueue = InteractionQueue<TreeNodeIndex>;
+using GlobalTraversalQueue = TraversalQueue<TreeNodeIndex>;
 
 template<class Kernel>
 unsigned maxConcurrentBlocks(Kernel kernel,
@@ -347,30 +350,6 @@ struct TraversalConfig
     //! @}
 };
 
-/*! @brief Lock-free ring queue in device memory for cross-block work sharing (interactions) */
-struct GlobalWorkQueue
-{
-    TreeNodeIndex* nodeA;       //!< [capacity] interaction node A
-    TreeNodeIndex* nodeB;       //!< [capacity] interaction node B
-    int*           isP2P;       //!< [capacity] 1=p2p, 0=m2l (int for alignment)
-    unsigned*      writeHead;   //!< atomic monotonic segment write counter
-    unsigned*      readHead;    //!< atomic monotonic segment read counter
-    unsigned*      segCount;    //!< [numSegments] valid item count per segment
-    unsigned*      segReady;    //!< [numSegments] per-segment ready flags
-    unsigned       numSegments; //!< capacity / chunkSize
-};
-
-/*! @brief Lock-free ring queue in device memory for cross-block traversal work sharing */
-struct GlobalTraversalQueue
-{
-    TreeNodeIndex* nodeA;       //!< [capacity] traversal node A
-    TreeNodeIndex* nodeB;       //!< [capacity] traversal node B
-    unsigned*      writeHead;   //!< atomic monotonic segment write counter
-    unsigned*      readHead;    //!< atomic monotonic segment read counter
-    unsigned*      segReady;    //!< [numSegments] per-segment ready flags
-    unsigned       numSegments; //!< capacity / travChunkSize
-};
-
 __device__ __forceinline__ bool isLeaf(const TreeNodeIndex* __restrict__ childOffsets,
                                        TreeNodeIndex n)
 {
@@ -580,347 +559,6 @@ bool assignPairByFrontierDeterministic(const TreeNodeIndex* __restrict__ childOf
     return active;
 }
 
-
-/*! @brief Try to push up to chunkSize items from a local interaction buffer to the global queue.
- *  @return true if push succeeded
- *  Vyukov-style MPMC: claim a unique slot via CAS on writeHead, then use 0/1 per-segment flag.
- *  Uses per-segment counts to avoid sentinel padding and scan-on-pop. */
-template<class TravConfig>
-__device__ __forceinline__ bool tryPushToGlobal(
-    GlobalWorkQueue gq,
-    TreeNodeIndex* __restrict__ bufA,
-    TreeNodeIndex* __restrict__ bufB,
-    int*           __restrict__ bufIsP2P,
-    unsigned*      __restrict__ bufCount,
-    bool                        force)
-{
-    constexpr unsigned chunk = TravConfig::chunkSize;
-
-    auto tile = cg::coalesced_threads();
-    const unsigned lane = tile.thread_rank();
-
-    // Phase 1: claim a unique write slot via CAS on writeHead
-    unsigned wHead = 0;
-    unsigned rHead = 0;
-    bool claimed = false;
-    do {
-        
-        if (lane == 0)
-        {
-            wHead = *gq.writeHead;
-            rHead = *gq.readHead;
-        }
-        wHead = tile.shfl(wHead, 0);
-        rHead = tile.shfl(rHead, 0);
-
-        if (wHead - rHead >= gq.numSegments) return false; // full
-
-        if (lane == 0) {
-            claimed = (atomicCAS(gq.writeHead, wHead, wHead + 1) == wHead);
-        }
-        claimed = tile.shfl(claimed, 0);
-    } while (force && !claimed);
-
-    if (!claimed) return false;
-
-    // Phase 2: wait for our segment to become free (bounded: only one specific pop can hold it)
-    unsigned seg = wHead % gq.numSegments;
-    if (lane == 0) {
-        for (unsigned spin = 0;; ++spin)
-        {
-            if (atomicAdd(&gq.segReady[seg], 0u) == 0u) break;
-            spinBackoff(spin);
-        }
-    }
-    tile.sync();
-
-    // Phase 3: write data
-    unsigned base      = seg * chunk;
-
-    unsigned count;
-    if (lane == 0) count = *bufCount;
-    count = tile.shfl(count, 0);
-
-    unsigned numPushed = min(chunk, count);
-    unsigned srcStart  = count - numPushed;
-
-    for (unsigned i = lane; i < numPushed; i += tile.num_threads()) {
-            gq.nodeA[base + i] = bufA[srcStart + i];
-            gq.nodeB[base + i] = bufB[srcStart + i];
-            gq.isP2P[base + i] = bufIsP2P[srcStart + i];
-    }
-
-    // Phase 4: publish data and update count
-    __threadfence();
-    if (lane == 0) {
-        *bufCount = count - numPushed;
-        gq.segCount[seg] = numPushed;
-        __threadfence();
-        atomicExch(&gq.segReady[seg], 1u);
-    }
-    return true;
-}
-
-/*! @brief Try to pop chunkSize items from global queue into local interaction buffer.
- *  @return true if pop succeeded
- *  Vyukov-style MPMC: claim a unique slot via CAS on readHead, then use 0/1 per-segment flag.
- *  Acquires ibFlag to safely grow the IB. */
-template<class TravConfig>
-__device__ __forceinline__ bool tryPopFromGlobal(
-    GlobalWorkQueue gq,
-    TreeNodeIndex* __restrict__ bufA,
-    TreeNodeIndex* __restrict__ bufB,
-    int*           __restrict__ bufIsP2P,
-    unsigned*      __restrict__ bufHead,
-    unsigned*      __restrict__ bufTail,
-    unsigned*      __restrict__ bufCount,
-    bool                        force,
-    unsigned*      __restrict__ ibFlag)
-{
-    constexpr unsigned chunk = TravConfig::chunkSize;
-
-    auto tile = cg::coalesced_threads();
-    const unsigned lane = tile.thread_rank();
-
-    // Phase 1: claim a unique read slot via CAS on readHead
-    // unsigned pos;
-    unsigned rHead = 0;
-    unsigned wHead = 0;
-    bool claimed = false;
-    do {
-        // unsigned rHead = 0, wHead = 0;
-        if (lane == 0)
-        {
-            rHead = *gq.readHead;
-            wHead = *gq.writeHead;
-        }
-        rHead = tile.shfl(rHead, 0);
-        wHead = tile.shfl(wHead, 0);
-
-        if (wHead <= rHead) return false; // empty
-
-        if (lane == 0) {
-            claimed = (atomicCAS(gq.readHead, rHead, rHead + 1) == rHead);
-        }
-        claimed = tile.shfl(claimed, 0);
-        // pos = rHead;
-    } while (force && !claimed);
-
-    if (!claimed) return false;
-
-    // Phase 2: wait for our segment's data to be published (bounded: one specific push)
-    unsigned seg = rHead % gq.numSegments;
-    if (lane == 0) {
-        for (unsigned spin = 0;; ++spin)
-        {
-            if (atomicAdd(&gq.segReady[seg], 0u) == 1u) break;
-            spinBackoff(spin);
-        }
-    }
-    tile.sync();
-    __threadfence();
-
-    unsigned base = seg * chunk;
-
-    // Exact payload length for this segment, published by producer.
-    unsigned validCount = 0;
-    if (lane == 0) validCount = gq.segCount[seg];
-    validCount = tile.shfl(validCount, 0);
-
-    // Acquire ibFlag and wait for enough local IB space before appending.
-    unsigned tail = 0;
-    unsigned count = 0;
-    bool haveSpace = false;
-    while (!haveSpace)
-    {
-        bool success = false;
-        if (lane == 0) success = acquireFlag(ibFlag);
-        success = tile.shfl(success, 0);
-        if (!success)
-        {
-            if (lane == 0) spinBackoff(8);
-            continue;
-        }
-
-        if (lane == 0)
-        {
-            tail = *bufTail;
-            count = *bufCount;
-            haveSpace = (count + validCount <= TravConfig::stackCap);
-            if (!haveSpace) releaseFlag(ibFlag);
-            if (!haveSpace) spinBackoff(8);
-        }
-        tail = tile.shfl(tail, 0);
-        count = tile.shfl(count, 0);
-        haveSpace = tile.shfl(haveSpace, 0);
-    }
-
-    // Phase 3: enqueue valid items into the local ring queue tail.
-    for (unsigned j = lane; j < validCount; j += tile.num_threads())
-    {
-        unsigned writeIdx = tail + j;
-        if (writeIdx >= TravConfig::stackCap) writeIdx -= TravConfig::stackCap;
-        bufA[writeIdx]     = gq.nodeA[base + j];
-        bufB[writeIdx]     = gq.nodeB[base + j];
-        bufIsP2P[writeIdx] = gq.isP2P[base + j];
-    }
-
-    // Phase 4: release ibFlag and free the segment
-    __threadfence_block();
-    if (lane == 0) {
-        unsigned newTail = tail + validCount;
-        if (newTail >= TravConfig::stackCap) newTail -= TravConfig::stackCap;
-        *bufTail  = newTail;
-        *bufCount = count + validCount;
-        (void)bufHead;
-        releaseFlag(ibFlag);
-        gq.segCount[seg] = 0u;
-        __threadfence();
-        atomicExch(&gq.segReady[seg], 0u);
-    }
-    return true;
-}
-
-/*! @brief Try to push travChunkSize items from local traversal stack to global traversal queue.
- *  @return true if push succeeded
- *  Vyukov-style MPMC: claim a unique slot via CAS on writeHead, then use 0/1 per-segment flag.
- *  Executed by lane 0 of producer warp only. */
-template<class TravConfig>
-__device__ __forceinline__ bool tryPushTraversalToGlobal(
-    GlobalTraversalQueue gq,
-    TreeNodeIndex* __restrict__ bufA,
-    TreeNodeIndex* __restrict__ bufB,
-    unsigned*      __restrict__ bufCount,
-    bool                        force)
-{
-    constexpr unsigned chunk = TravConfig::travChunkSize;
-
-    auto tile = cg::coalesced_threads();
-    const unsigned lane = tile.thread_rank();
-
-    // Phase 1: claim a unique write slot via CAS on writeHead
-    bool claimed = false;
-    unsigned rHead = 0;
-    unsigned wHead = 0;
-    do {
-        if (lane == 0) {
-            wHead = *gq.writeHead;
-            rHead = *gq.readHead;
-        }
-        wHead = tile.shfl(wHead, 0);
-        rHead = tile.shfl(rHead, 0);
-
-        if (wHead - rHead >= gq.numSegments) return false; // full
-
-        if (lane == 0) {
-            claimed = (atomicCAS(gq.writeHead, wHead, wHead + 1) == wHead);
-        }
-        claimed = tile.shfl(claimed, 0);
-    } while (force && !claimed);
-
-    if (!claimed) return false;
-
-    // Phase 2: wait for our segment to become free (bounded: only one specific pop can hold it)
-    unsigned seg = wHead % gq.numSegments;
-    if (lane == 0) {
-        for (unsigned spin = 0;; ++spin)
-        {
-            if (atomicAdd(&gq.segReady[seg], 0u) == 0u) break;
-            spinBackoff(spin);
-        }
-    }
-    tile.sync();
-
-    // Phase 3: write data
-    unsigned base  = seg * chunk;
-    unsigned count = *bufCount;
-    for (unsigned i = lane; i < chunk && i < count; i += tile.num_threads())
-    {
-        unsigned srcIdx = count - chunk + i;
-        // assert(srcIdx < TravConfig::stackCap && "tryPushTraversalToGlobal: srcIdx OOB");
-        gq.nodeA[base + i] = bufA[srcIdx];
-        gq.nodeB[base + i] = bufB[srcIdx];
-    }
-
-    // Phase 4: publish data and update count
-    __threadfence();
-    if (lane == 0) {
-        *bufCount = count - chunk;
-        __threadfence();
-        atomicExch(&gq.segReady[seg], 1u);
-    }
-    return true;
-}
-
-/*! @brief Try to pop travChunkSize items from global traversal queue into local stack.
- *  @return true if pop succeeded
- *  Vyukov-style MPMC: claim a unique slot via CAS on readHead, then use 0/1 per-segment flag.
- *  Executed by lane 0 of producer warp only. */
-template<class TravConfig>
-__device__ __forceinline__ bool tryPopTraversalFromGlobal(
-    GlobalTraversalQueue gq,
-    TreeNodeIndex* __restrict__ bufA,
-    TreeNodeIndex* __restrict__ bufB,
-    unsigned*      __restrict__ bufCount,
-    bool                        force)
-{
-    constexpr unsigned chunk = TravConfig::travChunkSize;
-
-    auto tile = cg::coalesced_threads();
-    const unsigned lane = tile.thread_rank();
-
-    // Phase 1: claim a unique read slot via CAS on readHead
-    unsigned rHead = 0;
-    unsigned wHead = 0;
-    bool claimed = false;
-    do {
-        if (lane == 0) {
-            rHead = *gq.readHead;
-            wHead = *gq.writeHead;
-        }
-        rHead = tile.shfl(rHead, 0);
-        wHead = tile.shfl(wHead, 0);
-
-        if (wHead <= rHead) return false; // empty
-
-        if (lane == 0) {
-            claimed = (atomicCAS(gq.readHead, rHead, rHead + 1) == rHead);
-        }
-        claimed = tile.shfl(claimed, 0);
-    } while (force && !claimed);
-
-    if (!claimed) return false;
-
-    // Phase 2: wait for our segment's data to be published (bounded: one specific push)
-    unsigned seg = rHead % gq.numSegments;
-    if (lane == 0) {
-        for (unsigned spin = 0;; ++spin)
-        {
-            if (atomicAdd(&gq.segReady[seg], 0u) == 1u) break;
-            spinBackoff(spin);
-        }
-    }
-    tile.sync();
-    __threadfence();
-
-    // Phase 3: read data
-    unsigned base = seg * chunk;
-    unsigned count = *bufCount;
-    for (unsigned i = lane; i < chunk; i += tile.num_threads())
-    {
-        // assert(count + i < TravConfig::stackCap && "tryPopTraversalFromGlobal: write OOB");
-        bufA[count + i] = gq.nodeA[base + i];
-        bufB[count + i] = gq.nodeB[base + i];
-    }
-
-    // Phase 4: update count and free the segment
-    if (lane == 0) {
-        *bufCount = count + chunk;
-        __threadfence();
-        atomicExch(&gq.segReady[seg], 0u);
-    }
-    return true;
-}
 
 template<int numWarps, class TravConfig,
          class MAC, class M2L, class P2P>
@@ -1238,12 +876,12 @@ __device__ void dualTraversalBlock(
                 if (curTmpIB == 0) break;
 
                 if (ibCount > TravConfig::forcePush || (ibCount + curTmpIB > TravConfig::stackCap)) {
-                    if (tryPushToGlobal<TravConfig>(globalQueue, tmpIBA[producerId], tmpIBB[producerId], tmpIBP2P[producerId], &tmpIBCount[producerId], true)) {}
+                    if (globalQueue.push(tmpIBA[producerId], tmpIBB[producerId], tmpIBP2P[producerId], &tmpIBCount[producerId], true)) {}
                     else if (lstop > TravConfig::travAttemptPush) {
-                        tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA[producerId], localStackB[producerId], &localStackTop[producerId], false);
+                        globalTraversalQueue.push(localStackA[producerId], localStackB[producerId], &localStackTop[producerId], false);
                     }
                 } else if (ibCount > TravConfig::attemptPush) {
-                    if (tryPushToGlobal<TravConfig>(globalQueue, tmpIBA[producerId], tmpIBB[producerId], tmpIBP2P[producerId], &tmpIBCount[producerId], false)) {}
+                    if (globalQueue.push(tmpIBA[producerId], tmpIBB[producerId], tmpIBP2P[producerId], &tmpIBCount[producerId], false)) {}
                     else {
                         if (ibQueuePush<TravConfig::stackCap>(interactionBufferA, interactionBufferB, interactionBufferIsP2P,
                                                               &interactionBufferHead, &interactionBufferTail,
@@ -1260,7 +898,7 @@ __device__ void dualTraversalBlock(
                         if (lane == 0) tmpIBCount[producerId] = 0;
                     }
                     else if (lstop > TravConfig::travForcePush) {
-                        tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA[producerId], localStackB[producerId], &localStackTop[producerId], false);
+                        globalTraversalQueue.push(localStackA[producerId], localStackB[producerId], &localStackTop[producerId], false);
                     }
                 }
               
@@ -1286,13 +924,13 @@ __device__ void dualTraversalBlock(
             if (lane == 0) curLST = localStackTop[producerId];
             curLST = __shfl_sync(0xFFFFFFFFu, curLST, 0);
             if (curLST >= TravConfig::travForcePush || (curLST + GpuConfig::warpSize * 8 >= stackCap)) {
-                tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA[producerId], localStackB[producerId], &localStackTop[producerId], true);
+                globalTraversalQueue.push(localStackA[producerId], localStackB[producerId], &localStackTop[producerId], true);
             } else if (curLST > TravConfig::travAttemptPush) {
-                tryPushTraversalToGlobal<TravConfig>(globalTraversalQueue, localStackA[producerId], localStackB[producerId], &localStackTop[producerId], false);
+                globalTraversalQueue.push(localStackA[producerId], localStackB[producerId], &localStackTop[producerId], false);
             } else if (curLST == 0) {
                 // unsigned readLocal
                 // do {
-                    if (tryPopTraversalFromGlobal<TravConfig>(globalTraversalQueue, localStackA[producerId], localStackB[producerId], &localStackTop[producerId], true)) {
+                    if (globalTraversalQueue.pop(localStackA[producerId], localStackB[producerId], &localStackTop[producerId], true)) {
                         if (lane == 0 && !currentlySignaledAsActive) {
                             atomicAdd(numActiveProducers, 1u);
                             __threadfence(); 
@@ -1314,7 +952,7 @@ __device__ void dualTraversalBlock(
                     
                 // } while (localStackTop == 0 && !terminate);
             } else if (curLST <= TravConfig::travAttemptPop) {
-                tryPopTraversalFromGlobal<TravConfig>(globalTraversalQueue, localStackA[producerId], localStackB[producerId], &localStackTop[producerId], false);
+                globalTraversalQueue.pop(localStackA[producerId], localStackB[producerId], &localStackTop[producerId], false);
             }
            
             __syncwarp();
@@ -1390,11 +1028,9 @@ __device__ void dualTraversalBlock(
 
             if(success) {
                 bool force = numLocal <= TravConfig::forcePop;
-                tryPopFromGlobal<TravConfig>(globalQueue,
-                                             interactionBufferA, interactionBufferB, interactionBufferIsP2P,
-                                             &interactionBufferHead, &interactionBufferTail,
-                                             &interactionBufferCount,
-                                             force, &ibFlag);
+                globalQueue.pop(interactionBufferA, interactionBufferB, interactionBufferIsP2P,
+                                &interactionBufferHead, &interactionBufferTail, &interactionBufferCount,
+                                TravConfig::stackCap, force, &ibFlag);
                 if (lane == 0) releaseFlag(&globalPopFlag);
             }
         }

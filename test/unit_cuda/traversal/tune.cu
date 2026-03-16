@@ -439,7 +439,7 @@ TuneResult benchOne(
     cudaMalloc(&d_segCount, gSegs * sizeof(unsigned));
     cudaMalloc(&d_sR,   gSegs * sizeof(unsigned));
     cudaMalloc(&d_nP,   sizeof(unsigned));
-    GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wH, d_rH, d_segCount, d_sR, gSegs};
+    GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wH, d_rH, d_segCount, d_sR, gSegs, gChunk};
 
     // ── Allocate global traversal queue ──
     constexpr unsigned tChunk = TravConfig::travChunkSize;
@@ -453,7 +453,7 @@ TuneResult benchOne(
     cudaMalloc(&d_twH, sizeof(unsigned));
     cudaMalloc(&d_trH, sizeof(unsigned));
     cudaMalloc(&d_tsR, tSegs * sizeof(unsigned));
-    GlobalTraversalQueue tq{d_tA, d_tB, d_twH, d_trH, d_tsR, tSegs};
+    GlobalTraversalQueue tq{d_tA, d_tB, d_twH, d_trH, d_tsR, tSegs, tChunk};
 
     // ── Launch config ──
     cudaLaunchConfig_t cfg{};
