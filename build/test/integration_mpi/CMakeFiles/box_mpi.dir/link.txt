@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/box_mpi.dir/link.d CMakeFiles/box_mpi.dir/box_mpi.cpp.o CMakeFiles/box_mpi.dir/test_main.cpp.o -o box_mpi  ../../lib/libgtest_main.a ../../lib/libgtest.a

@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/treedomain.dir/link.d CMakeFiles/treedomain.dir/treedomain.cpp.o CMakeFiles/treedomain.dir/test_main.cpp.o -o treedomain  ../../lib/libgtest_main.a ../../lib/libgtest.a

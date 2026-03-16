@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/globaloctree.dir/link.d CMakeFiles/globaloctree.dir/globaloctree.cpp.o CMakeFiles/globaloctree.dir/test_main.cpp.o -o globaloctree  ../../lib/libgtest_main.a ../../lib/libgtest.a
