@@ -394,8 +394,7 @@ void multipoleBenchmark(unsigned numParticles    = 2000000,
         cudaMemset(d_twHead, 0, sizeof(unsigned));
         cudaMemset(d_trHead, 0, sizeof(unsigned));
         cudaMemset(d_tsegR, 0, tSegs * sizeof(unsigned));
-        unsigned producerWarpsTotal = dualTotalBlocks * 2u;
-        cudaMemcpy(d_nProd, &producerWarpsTotal, sizeof(unsigned), cudaMemcpyHostToDevice);
+        cudaMemset(d_nProd, 0, sizeof(unsigned));
         cudaLaunchKernelEx(&dualCfg,
                            dualMultipoleKernel<DualConfig::numWarps, T>,
                            rawPtr(d_childOffsets),

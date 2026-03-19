@@ -13,12 +13,12 @@ set(UNIT_TEST_SOURCES_GPU
         sfc/common.cu
         traversal/groups.cu
         traversal/macs.cu
-	traversal/traversal.cu
-	traversal/surface_detection.cu
-	traversal/large_surface_detection.cu
-	traversal/collision.cu
-	traversal/synthetic.cu
-	traversal/multipole.cu
+	    traversal/traversal.cu
+	    traversal/surface_detection.cu
+	    traversal/large_surface_detection.cu
+	    traversal/collision.cu
+	    traversal/synthetic.cu
+	    traversal/multipole.cu
 	traversal/tune.cu
         tree/btree.cu
         tree/csarray.cu

@@ -153,8 +153,7 @@ void dualTraversalAllPairsGpu()
         dualTraversalCount<TravConfig::numWarps>,
         TravConfig::numThreadsPerBlock, TravConfig::kBlocksPerCluster);
     unsigned totalBlocks = std::min(TravConfig::kTotalBlocks, maxBlocks);
-    unsigned producerWarpsTotal = totalBlocks * 2u;
-    cudaMemcpy(d_nProd, &producerWarpsTotal, sizeof(unsigned), cudaMemcpyHostToDevice);
+    cudaMemset(d_nProd, 0, sizeof(unsigned));
     GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wHead, d_rHead, d_segCount, d_segR, gSegs};
 
     // Global traversal work buffer

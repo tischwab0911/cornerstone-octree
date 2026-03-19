@@ -476,8 +476,7 @@ TuneResult benchOne(
         cudaMemset(d_twH, 0, sizeof(unsigned));
         cudaMemset(d_trH, 0, sizeof(unsigned));
         cudaMemset(d_tsR, 0, tSegs * sizeof(unsigned));
-        unsigned producerWarpsTotal = total * 2u;
-        cudaMemcpy(d_nP, &producerWarpsTotal, sizeof(unsigned), cudaMemcpyHostToDevice);
+        cudaMemset(d_nP, 0, sizeof(unsigned));
         cudaLaunchKernelEx(&cfg,
             tuneDualP2PKernel<numWarps, TravConfig, T>,
             rawPtr(d_co), rawPtr(d_cen), rawPtr(d_sz),

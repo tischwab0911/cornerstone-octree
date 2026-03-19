@@ -20,6 +20,7 @@
 #include "cstone/cuda/gpu_config.cuh"
 #include "cstone/primitives/warpscan.cuh"
 #include <cuda_runtime.h>
+#include <cuda/ptx>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <cooperative_groups/scan.h>
@@ -136,7 +137,7 @@ unsigned maxConcurrentBlocks(Kernel kernel,
         totalBlocks = blocksPerCluster;
     }
 
-    return totalBlocks-192;
+    return totalBlocks;
 }
 
 /*! @brief Try to acquire a shared-memory spinlock flag (0=free, 1=held).
@@ -996,21 +997,19 @@ __device__ void dualTraversalBlock(
     // ── Handle trivial cases before entering producer loop ──
     if (producerBlock && warpId == 0)
     {
-        if (isLeaf(childOffsets, a) && isLeaf(childOffsets, b))
+        if (!continuation(a, b))
         {
-            // Both leaves: p2p if criterion passes, otherwise skip.
-            if (tid == 0 && continuation(a, b)) { p2p(a, b); }
-            trivial = true;
-        }
-        else if ((isLeaf(childOffsets, a) || isLeaf(childOffsets, b)) && !continuation(a, b))
-        {
-            // One leaf, criterion fails: m2l and done.
+            // MAC passes (well-separated): M2L regardless of leaf status
             if (tid == 0) { m2l(a, b); }
             trivial = true;
         }
-        // NOTE: when one is a leaf and continuation IS true, we must NOT
-        // treat it as trivial — the non-leaf side needs to be split further
-        // by the producer loop.
+        else if (isLeaf(childOffsets, a) && isLeaf(childOffsets, b))
+        {
+            // Both leaves, MAC fails: P2P
+            if (tid == 0) { p2p(a, b); }
+            trivial = true;
+        }
+        // else: MAC fails, at least one internal → producer loop descends
 
         if (trivial)
         {
@@ -1018,6 +1017,7 @@ __device__ void dualTraversalBlock(
             __threadfence();
             if (tid == 0)
             {
+                // printf("[P EXIT blk=%u] trivial (pair a=%d b=%d)\n", blockIdx.x, a, b);
                 trivialShared = 1;
                 unsigned pre = atomicSub(numActiveProducers, producerWarpCount);
                 // printf("[DECR blk=%u] TRIVIAL path, pre=%u\n", blockIdx.x, pre);
@@ -1057,9 +1057,26 @@ __device__ void dualTraversalBlock(
 
         // if (tid == 0) printf("[PRODUCER blk=%u] entering main loop a=%d b=%d\n", blockIdx.x, a, b);
 
+        // constexpr unsigned __producerMaxIter = 10000000; // DEBUG: force-exit after this many iterations
         // unsigned __producerIterCount = 0;
         for (;;)
         {
+            // if (__producerIterCount >= __producerMaxIter)
+            // {
+            //     if (lane == 0 && producerId == 0)
+            //         printf("[P blk=%u] TIMEOUT after %u iters, lstk=%u tmpIB=%u ibCnt=%u prod=%u\n",
+            //                blockIdx.x, __producerIterCount, localStackTop[producerId],
+            //                tmpIBCount[producerId],
+            //                atomicAdd(&interactionBufferCount, 0u),
+            //                atomicAdd(numActiveProducers, 0u));
+            //     // Signal this producer as inactive before bailing
+            //     if (lane == 0 && currentlySignaledAsActive)
+            //     {
+            //         atomicSub(numActiveProducers, 1u);
+            //         __threadfence();
+            //     }
+            //     break;
+            // }
             // ── Pop items from traversal stack, capped by available headroom ──
             // Each popped item generates up to 8 children, so we need
             // 8 * popCount free slots on the stack after the pop.
@@ -1218,11 +1235,17 @@ __device__ void dualTraversalBlock(
             }
             __syncwarp(); // ensure all writes to tmpIB/localStack are visible
 
-            // if (tid == 0 && (++__producerIterCount % 4096) == 0)
-            //     printf("[PRODUCER blk=%u] main iter=%u lstk=%u tmpIB=%u ibCount=%u producers=%u\n",
-            //            blockIdx.x, __producerIterCount, localStackTop,
-            //            atomicAdd(&tmpIBCount, 0u), atomicAdd(&interactionBufferCount, 0u),
-            //            atomicAdd(numActiveProducers, 0u));
+            // __producerIterCount++;
+            // if (lane == 0 && producerId == 0
+            //     && (__producerIterCount & 0x3FF) == 0
+            //     && __producerIterCount > 0)
+            //     printf("[P blk=%u] iter=%u lstk=%u tmpIB=%u ibCnt=%u prod=%u tW=%u tR=%u\n",
+            //            blockIdx.x, __producerIterCount, localStackTop[producerId],
+            //            tmpIBCount[producerId],
+            //            atomicAdd(&interactionBufferCount, 0u),
+            //            atomicAdd(numActiveProducers, 0u),
+            //            atomicAdd(globalTraversalQueue.writeHead, 0u),
+            //            atomicAdd(globalTraversalQueue.readHead, 0u));
 
             // unsigned __drainIter = 0;
             for (;;) {
@@ -1338,8 +1361,16 @@ __device__ void dualTraversalBlock(
             // }
             // terminate = __shfl_sync(0xFFFFFFFFu, terminate, 0);
             if (terminate) break;
-            
+
         }
+        // Per-block exit diagnostic
+        // if (lane == 0 && producerId == 0)
+        // {
+        //     bool wasTimeout = (__producerIterCount >= __producerMaxIter);
+        //     printf("[P EXIT blk=%u] iters=%u %s\n",
+        //            blockIdx.x, __producerIterCount,
+        //            wasTimeout ? "TIMEOUT" : "cooperative");
+        // }
         // -------------------------- DEBUG INFO --------------------------
         // if (tid == 0) printf("[PRODUCER blk=%u] exiting main loop\n", blockIdx.x);
         // __threadfence(); // ensure all IB/global-queue writes visible before signaling done
@@ -1350,19 +1381,31 @@ __device__ void dualTraversalBlock(
         // }
     }
 
+    // constexpr unsigned __consumerMaxIter = 10000000; // DEBUG: force-exit after this many iterations
     // unsigned consumerSpinCount = 0;
     auto tile = cg::coalesced_threads();
-    // auto pRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*numActiveProducers);
     auto wRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*globalQueue.writeHead);
     auto rRef = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(*globalQueue.readHead);
     const unsigned refillWarpId = (numWarps > producerWarpCount) ? producerWarpCount : 0u;
     for (;;)
     {
+        // if (consumerSpinCount >= __consumerMaxIter)
+        // {
+        //     if (lane == 0 && blockIdx.x == 0 && warpId == producerWarpCount)
+        //         printf("[C blk=0] TIMEOUT after %u spins, ibCnt=%u prod=%u iW=%u iR=%u\n",
+        //                consumerSpinCount,
+        //                atomicAdd(&interactionBufferCount, 0u),
+        //                atomicAdd(numActiveProducers, 0u),
+        //                atomicAdd(globalQueue.writeHead, 0u),
+        //                atomicAdd(globalQueue.readHead, 0u));
+        //     break;
+        // }
         // consumerSpinCount++;
-        // if (lane == 0 && (consumerSpinCount & 0x3FFFF) == 0)
-        //     printf("[Consumer blk=%u warp=%u] spin %u: ibCount=%u ibFlag=%u gPopFlag=%u "
-        //            "iactW=%u iactR=%u travW=%u travR=%u producers=%u, localStackTop=%u\n",
-        //            blockIdx.x, tid / GpuConfig::warpSize, consumerSpinCount,
+        // if (lane == 0 && blockIdx.x == 0 && warpId == producerWarpCount
+        //     && (consumerSpinCount & 0xFFFFF) == 0)
+        //     printf("[C blk=0] spin=%u ibCnt=%u ibFlg=%u gPop=%u "
+        //            "iW=%u iR=%u tW=%u tR=%u prod=%u lst0=%u\n",
+        //            consumerSpinCount,
         //            atomicAdd(&interactionBufferCount, 0u), atomicAdd(&ibFlag, 0u),
         //            atomicAdd(&globalPopFlag, 0u),
         //            atomicAdd(globalQueue.writeHead, 0u),
@@ -1370,7 +1413,7 @@ __device__ void dualTraversalBlock(
         //            atomicAdd(globalTraversalQueue.writeHead, 0u),
         //            atomicAdd(globalTraversalQueue.readHead, 0u),
         //            atomicAdd(numActiveProducers, 0u),
-        //             atomicAdd(&localStackTop, 0u));
+        //            atomicAdd(&localStackTop[0], 0u));
 
         // ── Try to pop items from local IB (flag-guarded) ──
         TreeNodeIndex itemA = 0u, itemB = 0u;
@@ -1425,7 +1468,7 @@ __device__ void dualTraversalBlock(
             if (itemIsP2P)  p2p(itemA, itemB);
             else            m2l(itemA, itemB);
         }
-        // __syncwarp();
+        __syncwarp();
 
         // unsigned localCount, wHead, rHead, producers;
 
@@ -1442,6 +1485,15 @@ __device__ void dualTraversalBlock(
         }
         if (terminate) break;
     }
+
+    // ----- Per-block exit diagnostic -----
+    // if (lane == 0)
+    // {
+    //     bool wasTimeout = (consumerSpinCount >= __consumerMaxIter);
+    //     printf("[C EXIT blk=%u] spin=%u %s\n",
+    //            blockIdx.x, consumerSpinCount,
+    //            wasTimeout ? "TIMEOUT" : "cooperative");
+    // }
 
 }
 
@@ -1488,6 +1540,15 @@ __device__ void dualTraversalGPU(const TreeNodeIndex* __restrict__ childOffsets,
                                  unsigned* __restrict__ numActiveProducers,
                                  MAC&& continuation, M2L&& m2l, P2P&& p2p)
 {
+    // Each block registers its producer warps on arrival. Blocks that
+    // are never scheduled simply never increment, preventing the
+    // occupancy deadlock when totalBlocks > GPU co-resident capacity.
+    if (cg::this_thread_block().thread_rank() == 0)
+    {
+        atomicAdd(numActiveProducers, kProducerWarpsPerBlock);
+    }
+    cg::this_thread_block().sync();
+
     const unsigned cluster_id  = cluster_rank_in_grid();
     const unsigned numClusters = num_clusters_runtime();
 
